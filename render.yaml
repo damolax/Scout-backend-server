@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: scout-email-finder
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3001
+    healthCheckPath: /
