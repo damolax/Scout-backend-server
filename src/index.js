@@ -327,6 +327,84 @@ app.get('/admin/stats', (req, res) => {
   });
 });
 
+
+// ── GMAIL OAUTH ENDPOINTS ─────────────────────────────────────────────────────
+
+// Exchange authorization code for tokens
+app.post('/gmail/exchange', async (req, res) => {
+  const { code, redirect_uri, client_id } = req.body;
+  if (!code || !client_id) return res.status(400).json({ error: 'code and client_id required' });
+
+  // Note: For security, client_secret should be in env var
+  // User sets it up in their own Google Cloud project
+  const client_secret = process.env.GOOGLE_CLIENT_SECRET || '';
+  if (!client_secret) {
+    return res.status(400).json({ 
+      error: 'GOOGLE_CLIENT_SECRET not set on server. Add it to your Render environment variables.',
+      setup_instructions: 'Go to Render dashboard → Your service → Environment → Add GOOGLE_CLIENT_SECRET'
+    });
+  }
+
+  try {
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      code,
+      client_id,
+      client_secret,
+      redirect_uri,
+      grant_type: 'authorization_code',
+    }, { headers: { 'Content-Type': 'application/json' } });
+
+    const tokens = tokenRes.data;
+
+    // Get the user's email
+    let email = 'unknown@gmail.com';
+    if (tokens.access_token) {
+      try {
+        const profileRes = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+          headers: { 'Authorization': 'Bearer ' + tokens.access_token }
+        });
+        email = profileRes.data.email || email;
+      } catch {}
+    }
+
+    res.json({
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_in: tokens.expires_in || 3600,
+      email,
+    });
+  } catch (err) {
+    const errData = err.response?.data || {};
+    res.status(400).json({ error: errData.error_description || errData.error || err.message });
+  }
+});
+
+// Refresh access token
+app.post('/gmail/refresh', async (req, res) => {
+  const { refresh_token, client_id } = req.body;
+  if (!refresh_token || !client_id) return res.status(400).json({ error: 'refresh_token and client_id required' });
+
+  const client_secret = process.env.GOOGLE_CLIENT_SECRET || '';
+  if (!client_secret) return res.status(400).json({ error: 'GOOGLE_CLIENT_SECRET not set' });
+
+  try {
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      refresh_token,
+      client_id,
+      client_secret,
+      grant_type: 'refresh_token',
+    }, { headers: { 'Content-Type': 'application/json' } });
+
+    res.json({
+      access_token: tokenRes.data.access_token,
+      expires_in: tokenRes.data.expires_in || 3600,
+    });
+  } catch (err) {
+    const errData = err.response?.data || {};
+    res.status(400).json({ error: errData.error_description || err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Scout Backend v3.1 on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
 });
