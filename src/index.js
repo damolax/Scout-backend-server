@@ -3,6 +3,7 @@ const cors = require('cors');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const dns = require('dns').promises;
 
 const app = express();
 app.use(cors());
@@ -11,6 +12,12 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || 'scout-admin-2026';
+const EMAIL_VERIFIER_PROVIDER = String(process.env.EMAIL_VERIFIER_PROVIDER || '').toLowerCase();
+const ZEROBOUNCE_API_KEY = process.env.ZEROBOUNCE_API_KEY || '';
+const ABSTRACT_EMAIL_API_KEY = process.env.ABSTRACT_EMAIL_API_KEY || '';
+const HUNTER_API_KEY = process.env.HUNTER_API_KEY || '';
+const NEVERBOUNCE_API_KEY = process.env.NEVERBOUNCE_API_KEY || '';
+const KICKBOX_API_KEY = process.env.KICKBOX_API_KEY || '';
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
 let contactedPlaceIds = {};
@@ -207,11 +214,206 @@ async function getPlaceDetails(placeId) {
   } catch(e) { return { error: e.message, website: null, phone: null }; }
 }
 
+
+// ── EMAIL VERIFICATION HELPERS ───────────────────────────────────────────────
+
+const ROLE_PREFIXES = new Set([
+  'info','contact','hello','hi','sales','support','help','admin','office','team','mail','enquiries','enquiry',
+  'booking','bookings','appointments','service','services','customerservice','customer.service','reception',
+  'marketing','business','operations','care','clientcare','frontdesk','studio','quotes','quote','accounts'
+]);
+const FREE_EMAIL_DOMAINS = new Set([
+  'gmail.com','yahoo.com','outlook.com','hotmail.com','live.com','icloud.com','aol.com','proton.me','protonmail.com',
+  'mail.com','zoho.com','yandex.com','gmx.com','msn.com'
+]);
+const DISPOSABLE_DOMAINS = new Set([
+  'mailinator.com','10minutemail.com','guerrillamail.com','tempmail.com','temp-mail.org','throwawaymail.com',
+  'yopmail.com','trashmail.com','getnada.com','sharklasers.com','dispostable.com','fakeinbox.com'
+]);
+
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase().replace(/^mailto:/, '').split('?')[0].replace(/[.,;:)>"]+$/, '').replace(/^[<(\[]+/, '');
+}
+function emailParts(email) {
+  const normalized = normalizeEmail(email);
+  const m = normalized.match(/^([a-z0-9._%+\-]{1,64})@([a-z0-9.\-]+\.[a-z]{2,})$/i);
+  if (!m) return { normalized, local: '', domain: '', validFormat: false };
+  return { normalized, local: m[1], domain: m[2], validFormat: true };
+}
+function isRoleEmail(local) {
+  const base = String(local || '').toLowerCase().split(/[+._-]/)[0];
+  return ROLE_PREFIXES.has(base) || /^(info|contact|hello|sales|support|admin|office|team|booking|enquir)/.test(base);
+}
+function getVerifierProviderKey(provider) {
+  provider = String(provider || EMAIL_VERIFIER_PROVIDER || '').toLowerCase();
+  if (provider === 'zerobounce') return ZEROBOUNCE_API_KEY;
+  if (provider === 'abstract') return ABSTRACT_EMAIL_API_KEY;
+  if (provider === 'hunter') return HUNTER_API_KEY;
+  if (provider === 'neverbounce') return NEVERBOUNCE_API_KEY;
+  if (provider === 'kickbox') return KICKBOX_API_KEY;
+  return '';
+}
+
+async function checkMx(domain) {
+  try {
+    const records = await dns.resolveMx(domain);
+    const sorted = (records || []).sort((a,b) => (a.priority || 0) - (b.priority || 0));
+    return { hasMx: sorted.length > 0, mxRecords: sorted.map(r => r.exchange).slice(0, 5) };
+  } catch(e) {
+    // Some domains accept mail on A record even without MX, but for outreach treat no-MX as not ready.
+    return { hasMx: false, mxRecords: [], mxError: e.code || e.message };
+  }
+}
+
+function providerToStatus(provider, data) {
+  provider = String(provider || '').toLowerCase();
+  let raw = '', reason = '', score = null;
+
+  if (provider === 'zerobounce') {
+    raw = String(data.status || '').toLowerCase();
+    reason = data.sub_status || data.did_you_mean || raw;
+  } else if (provider === 'abstract') {
+    raw = String(data.deliverability || '').toLowerCase();
+    reason = data.quality_score != null ? `quality_score=${data.quality_score}` : raw;
+    score = data.quality_score != null ? Math.round(Number(data.quality_score) * 100) : null;
+  } else if (provider === 'hunter') {
+    raw = String(data.data?.status || data.status || data.data?.result || '').toLowerCase();
+    reason = data.data?.result || data.data?.regexp || raw;
+    score = data.data?.score != null ? Number(data.data.score) : null;
+  } else if (provider === 'neverbounce') {
+    raw = String(data.result || '').toLowerCase();
+    reason = data.flags ? String(data.flags) : raw;
+  } else if (provider === 'kickbox') {
+    raw = String(data.result || '').toLowerCase();
+    reason = data.reason || raw;
+  }
+
+  if (/^(valid|deliverable)$/.test(raw)) return { status: 'valid', providerStatus: raw, providerReason: reason, providerScore: score };
+  if (/catch|accept_all|accept-all/.test(raw)) return { status: 'catch_all', providerStatus: raw, providerReason: reason, providerScore: score };
+  if (/risk|risky|role|webmail/.test(raw)) return { status: 'risky', providerStatus: raw, providerReason: reason, providerScore: score };
+  if (/invalid|undeliverable|do_not_mail|spamtrap|abuse|disposable/.test(raw)) return { status: 'invalid', providerStatus: raw, providerReason: reason, providerScore: score };
+  return { status: 'unknown', providerStatus: raw || 'unknown', providerReason: reason || 'unknown', providerScore: score };
+}
+
+async function verifyWithProvider(email, provider) {
+  provider = String(provider || EMAIL_VERIFIER_PROVIDER || '').toLowerCase();
+  const key = getVerifierProviderKey(provider);
+  if (!provider || !key) return null;
+  const encodedEmail = encodeURIComponent(email);
+  let url = '';
+  if (provider === 'zerobounce') url = `https://api.zerobounce.net/v2/validate?api_key=${encodeURIComponent(key)}&email=${encodedEmail}`;
+  else if (provider === 'abstract') url = `https://emailvalidation.abstractapi.com/v1/?api_key=${encodeURIComponent(key)}&email=${encodedEmail}`;
+  else if (provider === 'hunter') url = `https://api.hunter.io/v2/email-verifier?email=${encodedEmail}&api_key=${encodeURIComponent(key)}`;
+  else if (provider === 'neverbounce') url = `https://api.neverbounce.com/v4/single/check?key=${encodeURIComponent(key)}&email=${encodedEmail}`;
+  else if (provider === 'kickbox') url = `https://api.kickbox.com/v2/verify?email=${encodedEmail}&apikey=${encodeURIComponent(key)}`;
+  else return null;
+
+  try {
+    const res = await axios.get(url, { timeout: 15000, validateStatus: s => s < 500 });
+    return { provider, raw: res.data, ...providerToStatus(provider, res.data || {}) };
+  } catch(e) {
+    return { provider, status: 'unknown', providerStatus: 'error', providerReason: e.message, raw: null };
+  }
+}
+
+async function verifyEmailAddress(email, provider = EMAIL_VERIFIER_PROVIDER) {
+  const parts = emailParts(email);
+  const base = {
+    email: parts.normalized,
+    domain: parts.domain,
+    validFormat: parts.validFormat,
+    isRoleBased: parts.validFormat ? isRoleEmail(parts.local) : false,
+    isFreeProvider: parts.validFormat ? FREE_EMAIL_DOMAINS.has(parts.domain) : false,
+    isDisposable: parts.validFormat ? DISPOSABLE_DOMAINS.has(parts.domain) : false,
+    hasMx: false,
+    mxRecords: [],
+    provider: provider || 'basic_mx',
+    providerStatus: '',
+    providerReason: '',
+    status: 'unknown',
+    score: 0,
+    readyToContact: false,
+    checkedAt: new Date().toISOString(),
+  };
+
+  if (!parts.validFormat) return { ...base, status: 'invalid', providerReason: 'bad_format', score: 0 };
+  if (base.isDisposable) return { ...base, status: 'invalid', providerReason: 'disposable_domain', score: 0 };
+
+  const mx = await checkMx(parts.domain);
+  base.hasMx = mx.hasMx; base.mxRecords = mx.mxRecords; if (mx.mxError) base.mxError = mx.mxError;
+  if (!base.hasMx) return { ...base, status: 'invalid', providerReason: 'no_mx_records', score: 5 };
+
+  const providerResult = await verifyWithProvider(parts.normalized, provider);
+  if (providerResult) {
+    let score = 50;
+    if (providerResult.status === 'valid') score = 90;
+    else if (providerResult.status === 'catch_all') score = 62;
+    else if (providerResult.status === 'risky') score = 55;
+    else if (providerResult.status === 'unknown') score = 45;
+    else if (providerResult.status === 'invalid') score = 0;
+    if (base.isRoleBased && score > 0) score -= 10;
+    if (base.isFreeProvider && score > 0) score -= 5;
+    score = Math.max(0, Math.min(100, providerResult.providerScore != null ? Number(providerResult.providerScore) : score));
+    return {
+      ...base,
+      provider: providerResult.provider,
+      providerStatus: providerResult.providerStatus,
+      providerReason: providerResult.providerReason,
+      providerRaw: providerResult.raw,
+      status: providerResult.status,
+      score,
+      readyToContact: providerResult.status === 'valid' && score >= 70,
+    };
+  }
+
+  // Built-in free mode: safe but conservative. It proves the domain can receive mail, not that this mailbox exists.
+  let score = 58;
+  if (base.isRoleBased) score -= 8;
+  if (base.isFreeProvider) score -= 5;
+  return {
+    ...base,
+    provider: 'basic_mx',
+    providerStatus: 'mx_found_only',
+    providerReason: 'No external verifier API key configured. MX/domain check passed but mailbox-level verification was not performed.',
+    status: base.isRoleBased ? 'risky' : 'needs_provider',
+    score,
+    readyToContact: false,
+  };
+}
+
+function applyVerificationToLead(lead, result) {
+  return {
+    ...lead,
+    verificationStatus: result.status,
+    verificationScore: result.score,
+    verificationProvider: result.provider,
+    verificationReason: result.providerReason,
+    verifierStatus: result.providerStatus,
+    verifiedAt: result.checkedAt,
+    isRoleBased: result.isRoleBased,
+    isFreeProvider: result.isFreeProvider,
+    isDisposable: result.isDisposable,
+    hasMx: result.hasMx,
+    readyToContact: !!result.readyToContact,
+  };
+}
+
+function leadMatchesStatus(lead, status) {
+  if (!status) return true;
+  if (status === 'ready') return !!lead.readyToContact;
+  if (status === 'needs_verification') return !lead.verificationStatus || lead.verificationStatus === 'needs_verification';
+  return lead.verificationStatus === status;
+}
+
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v3.3', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v3.4', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
+  emailVerifier: {
+    provider: EMAIL_VERIFIER_PROVIDER || 'basic_mx',
+    hasProviderKey: !!getVerifierProviderKey(EMAIL_VERIFIER_PROVIDER),
+  },
   stats: { totalContacted: Object.keys(contactedPlaceIds).length, dailySummaries: dailySummaries.length }
 }));
 
@@ -262,6 +464,12 @@ app.post('/dork-leads', (req, res) => {
       sourceSignal: raw.sourceSignal ?? raw.source_signal ?? '',
       addedAt: raw.addedAt || new Date().toISOString(),
       source: raw.source || 'dorking',
+      verificationStatus: raw.verificationStatus || raw.verification_status || 'needs_verification',
+      verificationScore: raw.verificationScore || raw.verification_score || '',
+      verificationProvider: raw.verificationProvider || raw.verification_provider || '',
+      verificationReason: raw.verificationReason || raw.verification_reason || '',
+      verifiedAt: raw.verifiedAt || raw.verified_at || '',
+      readyToContact: !!(raw.readyToContact || raw.ready_to_contact),
     };
     const key = String(lead.email || '') + '|' + String(lead.website || '');
     if (key.trim() && !seen.has(key)) { existing.push(lead); seen.add(key); added++; }
@@ -273,11 +481,110 @@ app.post('/dork-leads', (req, res) => {
 app.get('/dork-leads', (req, res) => {
   const leads = readJsonFile(DORK_LEADS_FILE, []);
   if (req.query.format === 'csv') {
-    const headers = ['name','email','emails','website','industry','location','sourceQuery','sourceSignal','addedAt'];
+    const headers = ['name','email','emails','website','industry','location','sourceQuery','sourceSignal','addedAt','verificationStatus','verificationScore','verificationProvider','verificationReason','verifiedAt','readyToContact'];
     const lines = [headers.map(csvEscape).join(',')];
     leads.forEach(l => lines.push(headers.map(h => csvEscape(h === 'emails' ? (l.emails || []).join('; ') : l[h])).join(',')));
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="dork-leads.csv"');
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.json({ success: true, total: leads.length, leads });
+});
+
+
+// ── EMAIL VERIFICATION ROUTES ────────────────────────────────────────────────
+
+app.get('/verifier-config', (req, res) => {
+  const provider = String(req.query.provider || EMAIL_VERIFIER_PROVIDER || '').toLowerCase();
+  res.json({
+    success: true,
+    defaultProvider: EMAIL_VERIFIER_PROVIDER || 'basic_mx',
+    requestedProvider: provider || 'basic_mx',
+    hasProviderKey: !!getVerifierProviderKey(provider),
+    supportedProviders: ['basic_mx','zerobounce','abstract','hunter','neverbounce','kickbox'],
+    note: getVerifierProviderKey(provider) ? 'Mailbox-level verification enabled.' : 'Using built-in format + DNS/MX verification only until you add a verifier API key.'
+  });
+});
+
+app.post('/verify-email', async (req, res) => {
+  const email = req.body?.email;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  const result = await verifyEmailAddress(email, req.body?.provider);
+  res.json({ success: true, result });
+});
+
+app.post('/batch-verify-emails', async (req, res) => {
+  const emails = Array.isArray(req.body?.emails)
+    ? req.body.emails
+    : Array.isArray(req.body?.leads)
+      ? req.body.leads.map(l => l.email || (Array.isArray(l.emails) ? l.emails[0] : '')).filter(Boolean)
+      : [];
+  if (!emails.length) return res.status(400).json({ error: 'emails array or leads array required' });
+  const unique = Array.from(new Set(emails.map(normalizeEmail).filter(Boolean))).slice(0, 500);
+  const results = [];
+  for (const email of unique) {
+    results.push(await verifyEmailAddress(email, req.body?.provider));
+    await new Promise(r => setTimeout(r, Number(req.body?.delayMs || 150)));
+  }
+  res.json({ success: true, total: results.length, results });
+});
+
+app.post('/verify-dork-leads', async (req, res) => {
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  const limit = Math.max(1, Math.min(500, parseInt(req.body?.limit || 100, 10)));
+  const force = !!req.body?.force;
+  let checked = 0;
+  for (let i = 0; i < leads.length && checked < limit; i++) {
+    const lead = leads[i];
+    const email = lead.email || (Array.isArray(lead.emails) ? lead.emails[0] : '');
+    if (!email) continue;
+    if (!force && lead.verificationStatus && lead.verificationStatus !== 'needs_verification') continue;
+    const result = await verifyEmailAddress(email, req.body?.provider);
+    leads[i] = applyVerificationToLead(lead, result);
+    checked++;
+    await new Promise(r => setTimeout(r, Number(req.body?.delayMs || 150)));
+  }
+  writeJsonFile(DORK_LEADS_FILE, leads);
+  const summary = leads.reduce((a,l) => { const k = l.readyToContact ? 'ready' : (l.verificationStatus || 'needs_verification'); a[k] = (a[k] || 0) + 1; return a; }, {});
+  res.json({ success: true, checked, total: leads.length, summary });
+});
+
+app.post('/import-verification-results', (req, res) => {
+  const results = Array.isArray(req.body?.results) ? req.body.results : [];
+  if (!results.length) return res.status(400).json({ error: 'results array required' });
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  const map = new Map(results.map(r => [normalizeEmail(r.email), r]));
+  let updated = 0;
+  for (let i = 0; i < leads.length; i++) {
+    const email = normalizeEmail(leads[i].email || (Array.isArray(leads[i].emails) ? leads[i].emails[0] : ''));
+    const r = map.get(email);
+    if (!r) continue;
+    const status = String(r.status || r.verificationStatus || r.result || '').toLowerCase().replace(/\s+/g, '_');
+    leads[i] = {
+      ...leads[i],
+      verificationStatus: ['valid','risky','catch_all','invalid','unknown'].includes(status) ? status : (status === 'deliverable' ? 'valid' : status || 'unknown'),
+      verificationScore: r.score ?? r.verificationScore ?? '',
+      verificationProvider: r.provider || r.verificationProvider || 'imported',
+      verificationReason: r.reason || r.verificationReason || r.providerReason || '',
+      verifiedAt: r.verifiedAt || new Date().toISOString(),
+      readyToContact: ['valid','deliverable'].includes(status) && Number(r.score ?? 80) >= 70,
+    };
+    updated++;
+  }
+  writeJsonFile(DORK_LEADS_FILE, leads);
+  res.json({ success: true, updated, total: leads.length });
+});
+
+app.get('/verified-leads', (req, res) => {
+  const status = String(req.query.status || '').toLowerCase();
+  const leads = readJsonFile(DORK_LEADS_FILE, []).filter(l => leadMatchesStatus(l, status));
+  if (req.query.format === 'csv') {
+    const headers = ['name','email','website','industry','location','verificationStatus','verificationScore','verificationProvider','verificationReason','readyToContact','sourceQuery','addedAt','verifiedAt'];
+    const lines = [headers.map(csvEscape).join(',')];
+    leads.forEach(l => lines.push(headers.map(h => csvEscape(l[h])).join(',')));
+    const fileName = status === 'ready' ? 'ready-to-contact-leads.csv' : `verified-leads-${status || 'all'}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     return res.send('\ufeff' + lines.join('\r\n'));
   }
   res.json({ success: true, total: leads.length, leads });
