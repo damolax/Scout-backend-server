@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -13,6 +15,47 @@ const ADMIN_KEY = process.env.ADMIN_KEY || 'scout-admin-2026';
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
 let contactedPlaceIds = {};
 let dailySummaries = [];
+
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const DORK_SETTINGS_FILE = path.join(DATA_DIR, 'dork-settings.json');
+const DORK_LEADS_FILE = path.join(DATA_DIR, 'dork-leads.json');
+
+function ensureDataDir() {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+}
+
+function readJsonFile(file, fallback) {
+  try {
+    ensureDataDir();
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch { return fallback; }
+}
+
+function writeJsonFile(file, data) {
+  ensureDataDir();
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function normalizeDorkSettings(input = {}) {
+  const signals = Array.isArray(input.signals)
+    ? input.signals
+    : String(input.signals || '').split('\n');
+  const cleanSignals = signals.map(s => String(s || '').trim()).filter(Boolean).slice(0, 200);
+  const resultsRaw = parseInt(input.resultsPerSignal || input.results_per_signal || 30, 10);
+  const delayRaw = parseInt(input.delayBetweenPages || input.delay_between_pages || 8000, 10);
+  return {
+    industry: String(input.industry || '').trim(),
+    location: String(input.location || '').trim(),
+    signals: cleanSignals,
+    resultsPerSignal: Math.max(1, Math.min(100, Number.isFinite(resultsRaw) ? resultsRaw : 30)),
+    delayBetweenPages: Math.max(500, Math.min(60000, Number.isFinite(delayRaw) ? delayRaw : 8000)),
+    engine: input.engine || 'bing',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function csvEscape(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
 
 function todayUTC() { return new Date().toISOString().slice(0, 10); }
 function isToday(d) { return d === todayUTC(); }
@@ -167,12 +210,78 @@ async function getPlaceDetails(placeId) {
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v3.1', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v3.3', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
   stats: { totalContacted: Object.keys(contactedPlaceIds).length, dailySummaries: dailySummaries.length }
 }));
 
 app.get('/ping', (req, res) => res.json({ ok: true }));
+
+// ── DORKING SIGNAL SYNC ──────────────────────────────────────────────────────
+
+app.get('/dork-settings', (req, res) => {
+  const settings = readJsonFile(DORK_SETTINGS_FILE, normalizeDorkSettings({}));
+  res.json({ success: true, settings });
+});
+
+app.post('/dork-settings', (req, res) => {
+  const settings = normalizeDorkSettings(req.body || {});
+  writeJsonFile(DORK_SETTINGS_FILE, settings);
+  res.json({ success: true, settings });
+});
+
+// Backward-friendly aliases for anything calling these names.
+app.get('/signals', (req, res) => {
+  const settings = readJsonFile(DORK_SETTINGS_FILE, normalizeDorkSettings({}));
+  res.json({ success: true, settings, signals: settings.signals });
+});
+
+app.post('/signals', (req, res) => {
+  const payload = Array.isArray(req.body?.signals) ? req.body : { ...req.body, signals: req.body?.signals || req.body };
+  const settings = normalizeDorkSettings(payload || {});
+  writeJsonFile(DORK_SETTINGS_FILE, settings);
+  res.json({ success: true, settings, signals: settings.signals });
+});
+
+app.post('/dork-leads', (req, res) => {
+  const incoming = Array.isArray(req.body?.leads) ? req.body.leads : (req.body?.lead ? [req.body.lead] : []);
+  if (!incoming.length) return res.status(400).json({ error: 'lead or leads required' });
+  const existing = readJsonFile(DORK_LEADS_FILE, []);
+  const seen = new Set(existing.map(l => String(l.email || '') + '|' + String(l.website || '')));
+  let added = 0;
+  incoming.forEach(raw => {
+    const lead = {
+      id: raw.id || Math.random().toString(36).slice(2),
+      name: raw.name || raw.business_name || '',
+      email: raw.email || (Array.isArray(raw.emails) ? raw.emails[0] : ''),
+      emails: Array.isArray(raw.emails) ? raw.emails : (raw.email ? [raw.email] : []),
+      website: raw.website || '',
+      industry: raw.industry || '',
+      location: raw.location || '',
+      sourceQuery: raw.sourceQuery || raw.source_query || '',
+      sourceSignal: raw.sourceSignal ?? raw.source_signal ?? '',
+      addedAt: raw.addedAt || new Date().toISOString(),
+      source: raw.source || 'dorking',
+    };
+    const key = String(lead.email || '') + '|' + String(lead.website || '');
+    if (key.trim() && !seen.has(key)) { existing.push(lead); seen.add(key); added++; }
+  });
+  writeJsonFile(DORK_LEADS_FILE, existing.slice(-10000));
+  res.json({ success: true, added, total: existing.length });
+});
+
+app.get('/dork-leads', (req, res) => {
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  if (req.query.format === 'csv') {
+    const headers = ['name','email','emails','website','industry','location','sourceQuery','sourceSignal','addedAt'];
+    const lines = [headers.map(csvEscape).join(',')];
+    leads.forEach(l => lines.push(headers.map(h => csvEscape(h === 'emails' ? (l.emails || []).join('; ') : l[h])).join(',')));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="dork-leads.csv"');
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.json({ success: true, total: leads.length, leads });
+});
 
 // ── EMAIL FINDING ─────────────────────────────────────────────────────────────
 
@@ -406,5 +515,5 @@ app.post('/gmail/refresh', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Scout Backend v3.1 on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
+  console.log(`Scout Backend v3.3 on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
 });

@@ -1,0 +1,14 @@
+Scout Backend v3.3 FIXED
+
+What changed:
+1. Added GET /dork-settings
+2. Added POST /dork-settings
+3. Added GET /signals and POST /signals aliases
+4. Added POST /dork-leads
+5. Added GET /dork-leads and GET /dork-leads?format=csv
+6. Dork settings and dork leads are saved to backend data JSON files.
+
+Deploy notes:
+- Deploy this folder as your backend server.
+- Keep using npm install and npm start.
+- In the extension setup, save this backend URL without a trailing slash.

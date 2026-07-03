@@ -8,6 +8,4 @@ services:
     envVars:
       - key: PORT
         value: 3001
-      - key: GOOGLE_MAPS_API_KEY
-        sync: false
     healthCheckPath: /
