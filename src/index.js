@@ -26,6 +26,7 @@ let dailySummaries = [];
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const DORK_SETTINGS_FILE = path.join(DATA_DIR, 'dork-settings.json');
 const DORK_LEADS_FILE = path.join(DATA_DIR, 'dork-leads.json');
+const CAMPAIGNS_FILE = path.join(DATA_DIR, 'dork-campaigns.json');
 
 function ensureDataDir() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
@@ -405,10 +406,358 @@ function leadMatchesStatus(lead, status) {
   return lead.verificationStatus === status;
 }
 
+
+// ── CLOUD DORK CAMPAIGN RUNNER ──────────────────────────────────────────────
+
+const runningCampaigns = new Map();
+
+function normalizeUrl(v) {
+  const raw = String(v || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw.startsWith('http') ? raw : 'https://' + raw);
+    u.hash = '';
+    return u.toString();
+  } catch { return raw; }
+}
+
+function rootDomain(url) {
+  try { return new URL(url.startsWith('http') ? url : 'https://' + url).hostname.replace(/^www\./, ''); }
+  catch { return ''; }
+}
+
+function leadDedupeKey(lead) {
+  const email = normalizeEmail(lead.email || (Array.isArray(lead.emails) ? lead.emails[0] : ''));
+  if (email) return 'email:' + email;
+  const website = rootDomain(lead.website || lead.url || '');
+  if (website) return 'site:' + website;
+  return '';
+}
+
+function uniquePush(arr, values) {
+  const out = Array.isArray(arr) ? arr.slice() : [];
+  const seen = new Set(out.map(v => String(v || '').toLowerCase()));
+  (Array.isArray(values) ? values : [values]).forEach(v => {
+    const clean = String(v || '').trim();
+    const key = clean.toLowerCase();
+    if (clean && !seen.has(key)) { out.push(clean); seen.add(key); }
+  });
+  return out;
+}
+
+function normalizeDorkLead(raw = {}, context = {}) {
+  const email = normalizeEmail(raw.email || (Array.isArray(raw.emails) ? raw.emails[0] : ''));
+  const emails = uniquePush([], [email, ...(Array.isArray(raw.emails) ? raw.emails : [])].map(normalizeEmail).filter(Boolean));
+  const website = normalizeUrl(raw.website || raw.url || raw.sourceUrl || raw.source_url || '');
+  const domain = rootDomain(website);
+  const name = String(raw.name || raw.businessName || raw.business_name || raw.title || domain || (email ? email.split('@')[0] : 'Web lead')).trim();
+  const now = new Date().toISOString();
+  return {
+    id: raw.id || 'lead_' + Math.random().toString(36).slice(2) + Date.now().toString(36),
+    name,
+    businessName: raw.businessName || raw.business_name || name,
+    email,
+    emails,
+    website,
+    domain,
+    industry: raw.industry || context.industry || '',
+    location: raw.location || context.location || '',
+    sourceQuery: raw.sourceQuery || raw.source_query || context.sourceQuery || '',
+    sourceSignal: raw.sourceSignal ?? raw.source_signal ?? context.sourceSignal ?? '',
+    sourceUrl: raw.sourceUrl || raw.source_url || website || '',
+    source: raw.source || context.source || 'cloud_campaign',
+    sourceEngine: raw.sourceEngine || context.sourceEngine || 'bing',
+    campaignId: raw.campaignId || context.campaignId || '',
+    campaignIds: uniquePush(raw.campaignIds || [], [raw.campaignId || context.campaignId].filter(Boolean)),
+    sources: uniquePush(raw.sources || [], [raw.sourceUrl || raw.source_url || website, raw.sourceQuery || raw.source_query || context.sourceQuery].filter(Boolean)),
+    sourceSignals: uniquePush(raw.sourceSignals || [], [raw.sourceSignal ?? raw.source_signal ?? context.sourceSignal].filter(v => String(v ?? '').trim() !== '')),
+    sourceQueries: uniquePush(raw.sourceQueries || [], [raw.sourceQuery || raw.source_query || context.sourceQuery].filter(Boolean)),
+    addedAt: raw.addedAt || raw.createdAt || now,
+    firstSeenAt: raw.firstSeenAt || raw.addedAt || now,
+    lastSeenAt: raw.lastSeenAt || now,
+    sourceCount: Number(raw.sourceCount || 1),
+    status: raw.status || 'found',
+    verificationStatus: raw.verificationStatus || raw.verification_status || 'needs_verification',
+    verificationScore: raw.verificationScore || raw.verification_score || '',
+    verificationProvider: raw.verificationProvider || raw.verification_provider || '',
+    verificationReason: raw.verificationReason || raw.verification_reason || '',
+    verifiedAt: raw.verifiedAt || raw.verified_at || '',
+    readyToContact: !!(raw.readyToContact || raw.ready_to_contact),
+  };
+}
+
+function mergeDorkLead(existing, incoming) {
+  const now = new Date().toISOString();
+  const merged = { ...existing };
+  ['name','businessName','website','domain','industry','location','sourceQuery','sourceSignal','sourceUrl','sourceEngine','campaignId'].forEach(k => {
+    if (!merged[k] && incoming[k]) merged[k] = incoming[k];
+  });
+  merged.email = existing.email || incoming.email;
+  merged.emails = uniquePush(existing.emails || [], incoming.emails || incoming.email);
+  merged.campaignIds = uniquePush(existing.campaignIds || [], incoming.campaignIds || incoming.campaignId);
+  merged.sources = uniquePush(existing.sources || [], incoming.sources || incoming.sourceUrl || incoming.website || incoming.sourceQuery);
+  merged.sourceSignals = uniquePush(existing.sourceSignals || [], incoming.sourceSignals || incoming.sourceSignal);
+  merged.sourceQueries = uniquePush(existing.sourceQueries || [], incoming.sourceQueries || incoming.sourceQuery);
+  merged.firstSeenAt = existing.firstSeenAt || existing.addedAt || incoming.firstSeenAt || incoming.addedAt || now;
+  merged.lastSeenAt = now;
+  merged.updatedAt = now;
+  merged.sourceCount = Math.max(Number(existing.sourceCount || 1), (merged.sources || []).length || 1);
+  // Never downgrade verification fields if the email was already verified.
+  if (!existing.verificationStatus || existing.verificationStatus === 'needs_verification') {
+    merged.verificationStatus = incoming.verificationStatus || existing.verificationStatus || 'needs_verification';
+    merged.verificationScore = incoming.verificationScore || existing.verificationScore || '';
+    merged.verificationProvider = incoming.verificationProvider || existing.verificationProvider || '';
+    merged.verificationReason = incoming.verificationReason || existing.verificationReason || '';
+    merged.verifiedAt = incoming.verifiedAt || existing.verifiedAt || '';
+    merged.readyToContact = !!(incoming.readyToContact || existing.readyToContact);
+  }
+  return merged;
+}
+
+function saveDorkLeadBatch(incoming = [], context = {}) {
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  const byKey = new Map();
+  leads.forEach((lead, idx) => {
+    const normalized = normalizeDorkLead(lead, {});
+    leads[idx] = { ...normalized, ...lead, id: lead.id || normalized.id };
+    const key = leadDedupeKey(leads[idx]);
+    if (key) byKey.set(key, idx);
+  });
+  let added = 0, updated = 0, duplicates = 0;
+  const saved = [];
+  for (const raw of incoming) {
+    const lead = normalizeDorkLead(raw, context);
+    const key = leadDedupeKey(lead);
+    if (!key) continue;
+    if (byKey.has(key)) {
+      const idx = byKey.get(key);
+      leads[idx] = mergeDorkLead(leads[idx], lead);
+      updated++;
+      duplicates++;
+      saved.push(leads[idx]);
+    } else {
+      leads.push(lead);
+      byKey.set(key, leads.length - 1);
+      added++;
+      saved.push(lead);
+    }
+  }
+  writeJsonFile(DORK_LEADS_FILE, leads.slice(-50000));
+  return { added, updated, duplicates, total: leads.length, leads: saved };
+}
+
+function readCampaigns() { return readJsonFile(CAMPAIGNS_FILE, []); }
+function writeCampaigns(campaigns) { writeJsonFile(CAMPAIGNS_FILE, campaigns); }
+function saveCampaign(campaign) {
+  const campaigns = readCampaigns();
+  const idx = campaigns.findIndex(c => c.id === campaign.id);
+  campaign.updatedAt = new Date().toISOString();
+  if (idx >= 0) campaigns[idx] = campaign; else campaigns.unshift(campaign);
+  writeCampaigns(campaigns.slice(0, 200));
+  return campaign;
+}
+function getCampaign(id) { return readCampaigns().find(c => c.id === id); }
+function logCampaign(campaign, message) {
+  campaign.logs = Array.isArray(campaign.logs) ? campaign.logs : [];
+  campaign.logs.push({ at: new Date().toISOString(), message });
+  campaign.logs = campaign.logs.slice(-80);
+  saveCampaign(campaign);
+  console.log('[Cloud Campaign]', campaign.id, message);
+}
+
+function buildSearchQuery(signal, settings) {
+  let q = String(signal || '').trim();
+  q = q.replace(/\{industry\}/gi, settings.industry || '').replace(/\{location\}/gi, settings.location || '');
+  if (!q && settings.industry) q = `"${settings.industry}" "${settings.location || ''}" ("email" OR "contact" OR "@gmail.com")`;
+  return q.trim();
+}
+function htmlDecode(s) {
+  return String(s || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
+function extractTitle(html, fallback) {
+  const m = String(html || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return m ? htmlDecode(m[1]).replace(/\s+/g, ' ').trim().slice(0, 120) : fallback;
+}
+function extractBingUrls(html) {
+  const urls = new Set();
+  const blockRegex = /<li[^>]+class="[^"]*b_algo[^"]*"[\s\S]*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"/gi;
+  let m;
+  while ((m = blockRegex.exec(html))) urls.add(htmlDecode(m[1]));
+  const fallback = /<a[^>]+href="(https?:\/\/[^"]+)"/gi;
+  while ((m = fallback.exec(html))) urls.add(htmlDecode(m[1]));
+  return Array.from(urls)
+    .map(u => normalizeUrl(u))
+    .filter(u => /^https?:\/\//i.test(u))
+    .filter(u => !/(^https?:\/\/([^\/]+\.)?(bing|microsoft|msn)\.)/i.test(u))
+    .filter(u => !/\/search\?|\/images\//i.test(u))
+    .slice(0, 100);
+}
+
+async function searchBingUrls(query, limit = 30) {
+  const urls = [];
+  const seen = new Set();
+  const safeLimit = Math.max(1, Math.min(100, parseInt(limit || 30, 10)));
+  for (let first = 1; urls.length < safeLimit && first <= 91; first += 10) {
+    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=${first}`;
+    const html = await fetchPage(searchUrl, 12000);
+    const found = extractBingUrls(html);
+    for (const u of found) {
+      const key = normalizeUrl(u).replace(/\/$/, '');
+      if (!seen.has(key)) { seen.add(key); urls.push(u); }
+      if (urls.length >= safeLimit) break;
+    }
+    if (!found.length) break;
+    await new Promise(r => setTimeout(r, 600));
+  }
+  return urls.slice(0, safeLimit);
+}
+
+function createCampaignPayload(body = {}) {
+  const settings = normalizeDorkSettings(body.settings || body || {});
+  const maxEmailsRaw = parseInt(body.maxEmails || body.max_emails || body.targetEmails || body.target_emails || 1000, 10);
+  const maxPagesRaw = parseInt(body.maxPages || body.max_pages || (settings.signals.length * settings.resultsPerSignal), 10);
+  return {
+    id: body.id || 'camp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+    name: body.name || `${settings.industry || 'Airtable prospects'} in ${settings.location || 'selected market'}`,
+    type: 'cloud_dorking',
+    status: 'queued',
+    industry: settings.industry,
+    location: settings.location,
+    signals: settings.signals,
+    resultsPerSignal: settings.resultsPerSignal,
+    delayBetweenPages: settings.delayBetweenPages,
+    engine: settings.engine || 'bing',
+    maxEmails: Math.max(1, Math.min(10000, Number.isFinite(maxEmailsRaw) ? maxEmailsRaw : 1000)),
+    maxPages: Math.max(1, Math.min(50000, Number.isFinite(maxPagesRaw) ? maxPagesRaw : settings.signals.length * settings.resultsPerSignal)),
+    verifyWhileRunning: !!body.verifyWhileRunning,
+    createdAt: new Date().toISOString(),
+    startedAt: '',
+    finishedAt: '',
+    updatedAt: new Date().toISOString(),
+    totalSignals: settings.signals.length,
+    processedSignals: 0,
+    totalUrlsDiscovered: 0,
+    pagesChecked: 0,
+    emailsFound: 0,
+    newEmailsAdded: 0,
+    duplicatesSkipped: 0,
+    errors: 0,
+    currentSignal: '',
+    currentQuery: '',
+    currentUrl: '',
+    stopRequested: false,
+    logs: [],
+  };
+}
+
+async function runCloudCampaign(campaignId) {
+  if (runningCampaigns.has(campaignId)) return;
+  let campaign = getCampaign(campaignId);
+  if (!campaign) return;
+  runningCampaigns.set(campaignId, { startedAt: Date.now() });
+  campaign.status = 'running';
+  campaign.startedAt = campaign.startedAt || new Date().toISOString();
+  campaign.stopRequested = false;
+  saveCampaign(campaign);
+  logCampaign(campaign, 'Campaign started.');
+
+  try {
+    for (let sIndex = 0; sIndex < campaign.signals.length; sIndex++) {
+      campaign = getCampaign(campaignId) || campaign;
+      if (campaign.stopRequested || campaign.status === 'stopping') break;
+      const signal = campaign.signals[sIndex];
+      const query = buildSearchQuery(signal, campaign);
+      campaign.currentSignal = String(signal);
+      campaign.currentQuery = query;
+      saveCampaign(campaign);
+      logCampaign(campaign, `Searching signal ${sIndex + 1}/${campaign.signals.length}: ${query}`);
+
+      let urls = [];
+      try { urls = await searchBingUrls(query, campaign.resultsPerSignal); }
+      catch(e) { campaign.errors++; logCampaign(campaign, 'Bing search failed: ' + e.message); }
+      campaign.totalUrlsDiscovered += urls.length;
+      saveCampaign(campaign);
+
+      for (const url of urls) {
+        campaign = getCampaign(campaignId) || campaign;
+        if (campaign.stopRequested || campaign.status === 'stopping') break;
+        if (campaign.pagesChecked >= campaign.maxPages || campaign.newEmailsAdded >= campaign.maxEmails) break;
+        campaign.currentUrl = url;
+        saveCampaign(campaign);
+
+        try {
+          const html = await fetchPage(url, 12000);
+          const direct = cleanEmails(extractEmails(html));
+          let crawl = { emails: [] };
+          if (direct.length < 1) crawl = await crawlSiteForEmail(url);
+          const emails = cleanEmails(new Set([...(direct || []), ...((crawl && crawl.emails) || [])]));
+          campaign.pagesChecked++;
+          campaign.emailsFound += emails.length;
+
+          if (emails.length) {
+            const title = extractTitle(html, rootDomain(url));
+            const leadRows = emails.map(email => ({
+              name: title,
+              email,
+              emails: [email],
+              website: url,
+              industry: campaign.industry,
+              location: campaign.location,
+              sourceQuery: query,
+              sourceSignal: String(signal),
+              sourceUrl: url,
+              campaignId: campaign.id,
+              source: 'cloud_campaign',
+              sourceEngine: 'bing',
+            }));
+
+            if (campaign.verifyWhileRunning) {
+              for (let i = 0; i < leadRows.length; i++) {
+                const result = await verifyEmailAddress(leadRows[i].email);
+                leadRows[i] = applyVerificationToLead(leadRows[i], result);
+              }
+            }
+
+            const saved = saveDorkLeadBatch(leadRows, { campaignId: campaign.id, industry: campaign.industry, location: campaign.location, sourceQuery: query, sourceSignal: String(signal), source: 'cloud_campaign' });
+            campaign.newEmailsAdded += saved.added;
+            campaign.duplicatesSkipped += saved.duplicates;
+          }
+        } catch(e) {
+          campaign.errors++;
+          logCampaign(campaign, `Page failed: ${url} — ${e.message}`);
+        }
+
+        saveCampaign(campaign);
+        const delay = Math.max(250, Math.min(60000, Number(campaign.delayBetweenPages || 5000)));
+        await new Promise(r => setTimeout(r, delay));
+      }
+      campaign.processedSignals = sIndex + 1;
+      saveCampaign(campaign);
+      if (campaign.pagesChecked >= campaign.maxPages || campaign.newEmailsAdded >= campaign.maxEmails) break;
+    }
+
+    campaign = getCampaign(campaignId) || campaign;
+    if (campaign.stopRequested || campaign.status === 'stopping') campaign.status = 'stopped';
+    else campaign.status = 'completed';
+    campaign.finishedAt = new Date().toISOString();
+    campaign.currentUrl = '';
+    saveCampaign(campaign);
+    logCampaign(campaign, `Campaign ${campaign.status}. Added ${campaign.newEmailsAdded} new unique emails. Duplicates skipped/merged: ${campaign.duplicatesSkipped}.`);
+  } catch(e) {
+    campaign = getCampaign(campaignId) || campaign;
+    campaign.status = 'failed';
+    campaign.finishedAt = new Date().toISOString();
+    campaign.errors++;
+    logCampaign(campaign, 'Campaign failed: ' + e.message);
+  } finally {
+    runningCampaigns.delete(campaignId);
+  }
+}
+
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v3.4', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v3.5 Cloud Runner', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
   emailVerifier: {
     provider: EMAIL_VERIFIER_PROVIDER || 'basic_mx',
@@ -446,51 +795,112 @@ app.post('/signals', (req, res) => {
 });
 
 app.post('/dork-leads', (req, res) => {
-  const incoming = Array.isArray(req.body?.leads) ? req.body.leads : (req.body?.lead ? [req.body.lead] : []);
+  const incoming = Array.isArray(req.body?.leads) ? req.body.leads : (req.body?.lead ? [req.body.lead] : [req.body].filter(x => x && (x.email || x.website || x.url)));
   if (!incoming.length) return res.status(400).json({ error: 'lead or leads required' });
-  const existing = readJsonFile(DORK_LEADS_FILE, []);
-  const seen = new Set(existing.map(l => String(l.email || '') + '|' + String(l.website || '')));
-  let added = 0;
-  incoming.forEach(raw => {
-    const lead = {
-      id: raw.id || Math.random().toString(36).slice(2),
-      name: raw.name || raw.business_name || '',
-      email: raw.email || (Array.isArray(raw.emails) ? raw.emails[0] : ''),
-      emails: Array.isArray(raw.emails) ? raw.emails : (raw.email ? [raw.email] : []),
-      website: raw.website || '',
-      industry: raw.industry || '',
-      location: raw.location || '',
-      sourceQuery: raw.sourceQuery || raw.source_query || '',
-      sourceSignal: raw.sourceSignal ?? raw.source_signal ?? '',
-      addedAt: raw.addedAt || new Date().toISOString(),
-      source: raw.source || 'dorking',
-      verificationStatus: raw.verificationStatus || raw.verification_status || 'needs_verification',
-      verificationScore: raw.verificationScore || raw.verification_score || '',
-      verificationProvider: raw.verificationProvider || raw.verification_provider || '',
-      verificationReason: raw.verificationReason || raw.verification_reason || '',
-      verifiedAt: raw.verifiedAt || raw.verified_at || '',
-      readyToContact: !!(raw.readyToContact || raw.ready_to_contact),
-    };
-    const key = String(lead.email || '') + '|' + String(lead.website || '');
-    if (key.trim() && !seen.has(key)) { existing.push(lead); seen.add(key); added++; }
-  });
-  writeJsonFile(DORK_LEADS_FILE, existing.slice(-10000));
-  res.json({ success: true, added, total: existing.length });
+  const result = saveDorkLeadBatch(incoming, { source: 'extension_or_app' });
+  res.json({ success: true, ...result });
 });
 
 app.get('/dork-leads', (req, res) => {
-  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  let leads = readJsonFile(DORK_LEADS_FILE, []);
+  const campaignId = String(req.query.campaignId || req.query.campaign_id || '');
+  const since = String(req.query.since || req.query.updatedSince || '');
+  const status = String(req.query.status || '').toLowerCase();
+  if (campaignId) leads = leads.filter(l => l.campaignId === campaignId || (Array.isArray(l.campaignIds) && l.campaignIds.includes(campaignId)));
+  if (since) leads = leads.filter(l => String(l.lastSeenAt || l.updatedAt || l.addedAt || '') > since);
+  if (status) leads = leads.filter(l => leadMatchesStatus(l, status));
+  leads = leads.sort((a,b) => String(b.lastSeenAt || b.updatedAt || b.addedAt || '').localeCompare(String(a.lastSeenAt || a.updatedAt || a.addedAt || '')));
+  const limit = Math.max(1, Math.min(50000, parseInt(req.query.limit || leads.length || 1000, 10)));
+  const out = leads.slice(0, limit);
   if (req.query.format === 'csv') {
-    const headers = ['name','email','emails','website','industry','location','sourceQuery','sourceSignal','addedAt','verificationStatus','verificationScore','verificationProvider','verificationReason','verifiedAt','readyToContact'];
+    const headers = ['name','email','emails','website','industry','location','sourceQuery','sourceSignal','sourceQueries','sourceSignals','campaignIds','addedAt','lastSeenAt','verificationStatus','verificationScore','verificationProvider','verificationReason','verifiedAt','readyToContact'];
     const lines = [headers.map(csvEscape).join(',')];
-    leads.forEach(l => lines.push(headers.map(h => csvEscape(h === 'emails' ? (l.emails || []).join('; ') : l[h])).join(',')));
+    out.forEach(l => lines.push(headers.map(h => csvEscape(Array.isArray(l[h]) ? l[h].join('; ') : (h === 'emails' ? (l.emails || []).join('; ') : l[h]))).join(',')));
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="dork-leads.csv"');
     return res.send('\ufeff' + lines.join('\r\n'));
   }
-  res.json({ success: true, total: leads.length, leads });
+  res.json({ success: true, total: leads.length, returned: out.length, leads: out, serverTime: new Date().toISOString() });
 });
 
+
+
+// ── CLOUD CAMPAIGN ROUTES ───────────────────────────────────────────────────
+
+app.post('/campaigns/start', (req, res) => {
+  const campaign = createCampaignPayload(req.body || {});
+  if (!campaign.signals.length) return res.status(400).json({ error: 'signals required. Save dork settings or pass signals[] first.' });
+  saveCampaign(campaign);
+  setTimeout(() => runCloudCampaign(campaign.id), 50);
+  res.json({ success: true, campaign });
+});
+
+app.post('/dork-campaigns/start', (req, res) => {
+  const campaign = createCampaignPayload(req.body || {});
+  if (!campaign.signals.length) return res.status(400).json({ error: 'signals required. Save dork settings or pass signals[] first.' });
+  saveCampaign(campaign);
+  setTimeout(() => runCloudCampaign(campaign.id), 50);
+  res.json({ success: true, campaign });
+});
+
+app.get('/campaigns', (req, res) => {
+  const campaigns = readCampaigns().sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  res.json({ success: true, total: campaigns.length, running: Array.from(runningCampaigns.keys()), campaigns });
+});
+
+app.get('/campaigns/:id', (req, res) => {
+  const campaign = getCampaign(req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+  res.json({ success: true, campaign, isRunning: runningCampaigns.has(req.params.id), serverTime: new Date().toISOString() });
+});
+
+app.post('/campaigns/:id/stop', (req, res) => {
+  const campaign = getCampaign(req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+  campaign.stopRequested = true;
+  campaign.status = runningCampaigns.has(req.params.id) ? 'stopping' : 'stopped';
+  saveCampaign(campaign);
+  res.json({ success: true, campaign });
+});
+
+app.get('/campaigns/:id/leads', (req, res) => {
+  req.query.campaignId = req.params.id;
+  let leads = readJsonFile(DORK_LEADS_FILE, []).filter(l => l.campaignId === req.params.id || (Array.isArray(l.campaignIds) && l.campaignIds.includes(req.params.id)));
+  const since = String(req.query.since || req.query.updatedSince || '');
+  if (since) leads = leads.filter(l => String(l.lastSeenAt || l.updatedAt || l.addedAt || '') > since);
+  leads = leads.sort((a,b) => String(b.lastSeenAt || b.updatedAt || b.addedAt || '').localeCompare(String(a.lastSeenAt || a.updatedAt || a.addedAt || '')));
+  const limit = Math.max(1, Math.min(50000, parseInt(req.query.limit || leads.length || 1000, 10)));
+  const out = leads.slice(0, limit);
+  if (req.query.format === 'csv') {
+    const headers = ['name','email','website','industry','location','verificationStatus','readyToContact','sourceQuery','sourceSignal','addedAt','lastSeenAt'];
+    const lines = [headers.map(csvEscape).join(',')];
+    out.forEach(l => lines.push(headers.map(h => csvEscape(l[h])).join(',')));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="campaign-${req.params.id}-leads.csv"`);
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.json({ success: true, campaignId: req.params.id, total: leads.length, returned: out.length, leads: out, serverTime: new Date().toISOString() });
+});
+
+app.post('/campaigns/:id/verify-new', async (req, res) => {
+  const campaign = getCampaign(req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  const limit = Math.max(1, Math.min(500, parseInt(req.body?.limit || 100, 10)));
+  let checked = 0;
+  for (let i = 0; i < leads.length && checked < limit; i++) {
+    const l = leads[i];
+    const inCampaign = l.campaignId === req.params.id || (Array.isArray(l.campaignIds) && l.campaignIds.includes(req.params.id));
+    if (!inCampaign || !l.email) continue;
+    if (l.verificationStatus && l.verificationStatus !== 'needs_verification') continue;
+    const result = await verifyEmailAddress(l.email, req.body?.provider);
+    leads[i] = applyVerificationToLead(l, result);
+    checked++;
+    await new Promise(r => setTimeout(r, Number(req.body?.delayMs || 150)));
+  }
+  writeJsonFile(DORK_LEADS_FILE, leads);
+  res.json({ success: true, checked, campaignId: req.params.id });
+});
 
 // ── EMAIL VERIFICATION ROUTES ────────────────────────────────────────────────
 
@@ -822,5 +1232,5 @@ app.post('/gmail/refresh', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Scout Backend v3.3 on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
+  console.log(`Scout Backend v3.5 Cloud Runner on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
 });

@@ -1,31 +1,23 @@
-Scout Backend v3.4 VERIFIER FIXED
+Scout Backend v3.5 CLOUD RUNNER FIX
 
-What changed from v3.3:
-1. Added built-in email verification endpoints.
-2. Added GET /verifier-config.
-3. Added POST /verify-email.
-4. Added POST /batch-verify-emails.
-5. Added POST /verify-dork-leads to verify saved dork leads in the backend.
-6. Added POST /import-verification-results for importing results from external email verifiers.
-7. Added GET /verified-leads and /verified-leads?status=ready&format=csv.
-8. Dork leads now carry verificationStatus, verificationScore, verificationProvider, verificationReason, verifiedAt, and readyToContact.
+Added cloud/background dork campaign runner so campaigns can run on the deployed backend instead of inside the Chrome extension.
 
-Built-in verification mode:
-- Works without paid API key.
-- Checks email format, disposable domains, role-based emails, free-provider emails, and DNS/MX records.
-- It does NOT falsely claim mailbox-level validity. Without a verifier API key, deliverable domains are marked needs_provider or risky.
+New endpoints:
+- POST /campaigns/start
+- POST /dork-campaigns/start
+- GET /campaigns
+- GET /campaigns/:id
+- POST /campaigns/:id/stop
+- GET /campaigns/:id/leads
+- POST /campaigns/:id/verify-new
 
-Optional mailbox-level verifier providers:
-Set EMAIL_VERIFIER_PROVIDER to one of: zerobounce, abstract, hunter, neverbounce, kickbox.
-Then add the matching API key env var:
-- ZEROBOUNCE_API_KEY
-- ABSTRACT_EMAIL_API_KEY
-- HUNTER_API_KEY
-- NEVERBOUNCE_API_KEY
-- KICKBOX_API_KEY
+Improved lead dedupe:
+- Primary dedupe by normalized email.
+- Same email from another page/source is merged, not added twice.
+- Existing lead keeps firstSeenAt and updates lastSeenAt, sources, sourceSignals, sourceQueries, campaignIds, sourceCount.
 
-Recommended for Airtable outreach:
-1. Collect leads with signals.
-2. Run POST /verify-dork-leads.
-3. Export only /verified-leads?status=ready&format=csv.
-4. Send outreach only to readyToContact leads.
+Scout App can poll the backend while a campaign runs and import only new unique leads.
+
+Notes:
+- For campaigns to keep running while your computer is off, the backend host must stay awake. On Render free plans, services may sleep/restart; use an always-on plan for serious overnight campaigns.
+- Built-in verifier still requires an external provider key for true mailbox-level verification.
