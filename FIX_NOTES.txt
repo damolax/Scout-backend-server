@@ -1,23 +1,10 @@
-Scout Backend v3.5 CLOUD RUNNER FIX
+Scout Backend Server v3.6 CLOUD RUNNER FIX
 
-Added cloud/background dork campaign runner so campaigns can run on the deployed backend instead of inside the Chrome extension.
+Fixes added after v3.5:
+- Decodes Bing /ck/a redirect URLs so the cloud runner can discover real destination websites.
+- Adds broader Bing result parsing for href and data-url attributes.
+- Adds campaign logs showing how many destination URLs each signal discovers.
+- Adds safer search retry behavior when a Bing results page is empty.
+- Keeps email dedupe by normalized email; same email is merged, not duplicated.
 
-New endpoints:
-- POST /campaigns/start
-- POST /dork-campaigns/start
-- GET /campaigns
-- GET /campaigns/:id
-- POST /campaigns/:id/stop
-- GET /campaigns/:id/leads
-- POST /campaigns/:id/verify-new
-
-Improved lead dedupe:
-- Primary dedupe by normalized email.
-- Same email from another page/source is merged, not added twice.
-- Existing lead keeps firstSeenAt and updates lastSeenAt, sources, sourceSignals, sourceQueries, campaignIds, sourceCount.
-
-Scout App can poll the backend while a campaign runs and import only new unique leads.
-
-Notes:
-- For campaigns to keep running while your computer is off, the backend host must stay awake. On Render free plans, services may sleep/restart; use an always-on plan for serious overnight campaigns.
-- Built-in verifier still requires an external provider key for true mailbox-level verification.
+If campaigns previously completed with 0 emails instantly, this is likely the fix.

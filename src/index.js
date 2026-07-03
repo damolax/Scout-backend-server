@@ -578,18 +578,67 @@ function extractTitle(html, fallback) {
   const m = String(html || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   return m ? htmlDecode(m[1]).replace(/\s+/g, ' ').trim().slice(0, 120) : fallback;
 }
+function decodePossiblyBingRedirect(raw) {
+  let value = htmlDecode(String(raw || '').trim());
+  if (!value) return '';
+
+  // Bing frequently returns result anchors as /ck/a redirect URLs. The real URL is
+  // stored in the `u` parameter as base64/url-safe-base64 and often prefixed by `a1`.
+  // If we do not decode this, the runner filters the bing.com redirect out and ends
+  // campaigns with 0 discovered URLs.
+  try {
+    const url = new URL(value, 'https://www.bing.com');
+    const isBingRedirect = /(^|\.)bing\.com$/i.test(url.hostname) && /\/ck\/a/i.test(url.pathname);
+    if (isBingRedirect) {
+      let encoded = url.searchParams.get('u') || url.searchParams.get('url') || url.searchParams.get('r') || '';
+      encoded = htmlDecode(encoded).trim();
+      if (encoded.startsWith('a1')) encoded = encoded.slice(2);
+      if (encoded) {
+        // URL-safe base64 → normal base64.
+        let b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const decoded = Buffer.from(b64, 'base64').toString('utf8').trim();
+        if (/^https?:\/\//i.test(decoded)) return decoded;
+      }
+    }
+  } catch {}
+
+  // Sometimes Bing wraps the URL in a normal query parameter on non-/ck links.
+  try {
+    const url = new URL(value, 'https://www.bing.com');
+    const candidate = url.searchParams.get('u') || url.searchParams.get('url') || url.searchParams.get('r');
+    if (candidate && /^https?:\/\//i.test(candidate)) return candidate;
+  } catch {}
+
+  return value;
+}
+
+function isBlockedOrConsentPage(html) {
+  const text = String(html || '').toLowerCase();
+  return text.includes('captcha') || text.includes('unusual traffic') || text.includes('verify you are human') || text.includes('consent');
+}
+
 function extractBingUrls(html) {
   const urls = new Set();
-  const blockRegex = /<li[^>]+class="[^"]*b_algo[^"]*"[\s\S]*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"/gi;
   let m;
-  while ((m = blockRegex.exec(html))) urls.add(htmlDecode(m[1]));
-  const fallback = /<a[^>]+href="(https?:\/\/[^"]+)"/gi;
-  while ((m = fallback.exec(html))) urls.add(htmlDecode(m[1]));
+
+  // Primary Bing organic result blocks.
+  const blockRegex = /<li[^>]+class=["'][^"']*b_algo[^"']*["'][\s\S]*?<h2[^>]*>[\s\S]*?<a[^>]+href=["']([^"']+)["']/gi;
+  while ((m = blockRegex.exec(html))) urls.add(decodePossiblyBingRedirect(m[1]));
+
+  // Newer Bing variants sometimes use different attributes.
+  const hrefRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>/gi;
+  while ((m = hrefRegex.exec(html))) urls.add(decodePossiblyBingRedirect(m[1]));
+
+  const dataUrlRegex = /data-(?:url|href)=["']([^"']+)["']/gi;
+  while ((m = dataUrlRegex.exec(html))) urls.add(decodePossiblyBingRedirect(m[1]));
+
   return Array.from(urls)
     .map(u => normalizeUrl(u))
     .filter(u => /^https?:\/\//i.test(u))
-    .filter(u => !/(^https?:\/\/([^\/]+\.)?(bing|microsoft|msn)\.)/i.test(u))
-    .filter(u => !/\/search\?|\/images\//i.test(u))
+    .filter(u => !/(^https?:\/\/([^\/]+\.)?(bing|microsoft|msn|live)\.)/i.test(u))
+    .filter(u => !/\/search\?|\/images\/|\/videos\/|\/maps\?/i.test(u))
+    .filter(u => !/\.(jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?|pdf)(\?|$)/i.test(u))
     .slice(0, 100);
 }
 
@@ -597,17 +646,24 @@ async function searchBingUrls(query, limit = 30) {
   const urls = [];
   const seen = new Set();
   const safeLimit = Math.max(1, Math.min(100, parseInt(limit || 30, 10)));
+  let emptyPages = 0;
   for (let first = 1; urls.length < safeLimit && first <= 91; first += 10) {
-    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=${first}`;
-    const html = await fetchPage(searchUrl, 12000);
+    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=${first}&mkt=en-US&setlang=en-US&ensearch=1`;
+    const html = await fetchPage(searchUrl, 15000);
     const found = extractBingUrls(html);
     for (const u of found) {
       const key = normalizeUrl(u).replace(/\/$/, '');
       if (!seen.has(key)) { seen.add(key); urls.push(u); }
       if (urls.length >= safeLimit) break;
     }
-    if (!found.length) break;
-    await new Promise(r => setTimeout(r, 600));
+    if (!found.length) {
+      emptyPages++;
+      // Do not quit after one empty page; Bing can have a blocked/empty page or only ads.
+      if (emptyPages >= 2 || isBlockedOrConsentPage(html)) break;
+    } else {
+      emptyPages = 0;
+    }
+    await new Promise(r => setTimeout(r, 800));
   }
   return urls.slice(0, safeLimit);
 }
@@ -677,6 +733,10 @@ async function runCloudCampaign(campaignId) {
       catch(e) { campaign.errors++; logCampaign(campaign, 'Bing search failed: ' + e.message); }
       campaign.totalUrlsDiscovered += urls.length;
       saveCampaign(campaign);
+      logCampaign(campaign, `Discovered ${urls.length} destination URLs for this signal.`);
+      if (!urls.length) {
+        logCampaign(campaign, 'No destination URLs found. The signal may be weak, or Bing may have blocked/changed the search page.');
+      }
 
       for (const url of urls) {
         campaign = getCampaign(campaignId) || campaign;
@@ -695,6 +755,7 @@ async function runCloudCampaign(campaignId) {
           campaign.emailsFound += emails.length;
 
           if (emails.length) {
+            logCampaign(campaign, `Found ${emails.length} email(s) on ${url}`);
             const title = extractTitle(html, rootDomain(url));
             const leadRows = emails.map(email => ({
               name: title,
@@ -757,7 +818,7 @@ async function runCloudCampaign(campaignId) {
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v3.5 Cloud Runner', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v3.6 Cloud Runner Bing Redirect Fix', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
   emailVerifier: {
     provider: EMAIL_VERIFIER_PROVIDER || 'basic_mx',
