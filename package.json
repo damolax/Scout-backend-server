@@ -1,7 +1,7 @@
 {
   "name": "scout-email-finder",
-  "version": "3.7.0",
-  "description": "Scout backend with cloud dork campaign runner, Bing RSS fallback, debug search, dedupe, email verification, and lead sync",
+  "version": "4.3.0",
+  "description": "Scout backend with Email Scout Gmail batch sender and verification ready queue, browser Google Maps import, unified leads, smart templates, dorking, and verification",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

@@ -31,6 +31,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const DORK_SETTINGS_FILE = path.join(DATA_DIR, 'dork-settings.json');
 const DORK_LEADS_FILE = path.join(DATA_DIR, 'dork-leads.json');
 const CAMPAIGNS_FILE = path.join(DATA_DIR, 'dork-campaigns.json');
+const MAP_CAMPAIGNS_FILE = path.join(DATA_DIR, 'maps-campaigns.json');
+const MESSAGE_TEMPLATES_FILE = path.join(DATA_DIR, 'message-templates.json');
 
 function ensureDataDir() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
@@ -451,12 +453,41 @@ function rootDomain(url) {
   catch { return ''; }
 }
 
-function leadDedupeKey(lead) {
+function normalizeNameKey(v) {
+  return String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ').slice(0, 90);
+}
+
+function allLeadDedupeKeys(lead) {
+  const keys = [];
   const email = normalizeEmail(lead.email || (Array.isArray(lead.emails) ? lead.emails[0] : ''));
-  if (email) return 'email:' + email;
+  if (email) keys.push('email:' + email);
+
+  // Google Maps browser mode often discovers the business card/profile before a website/email exists.
+  // The previous version could skip those rows because it only deduped by email/place/site/name+location.
+  // Keep a Maps/profile URL key so browser Maps leads can be stored first, then enriched/merged later.
+  const placeId = String(lead.placeId || lead.place_id || lead.googlePlaceId || lead.google_place_id || '').trim();
+  if (placeId) keys.push('place:' + placeId);
+
+  const mapsUrl = normalizeUrl(lead.mapsUrl || lead.maps_url || lead.googleMapsUrl || lead.google_maps_url || '');
+  if (mapsUrl) keys.push('mapsurl:' + mapsUrl.replace(/\/$/, '').toLowerCase());
+
   const website = rootDomain(lead.website || lead.url || '');
-  if (website) return 'site:' + website;
-  return '';
+  if (website && !/(^|\.)google\./i.test(website)) keys.push('site:' + website);
+
+  const nameKey = normalizeNameKey(lead.businessName || lead.name || lead.companyName || '');
+  const locKey = normalizeNameKey(lead.location || lead.city || lead.address || '');
+  if (nameKey && locKey) keys.push('name_loc:' + nameKey + '|' + locKey);
+
+  // Last-resort browser Maps key. This is not used for normal dork/uploaded leads.
+  // It prevents "0 imported" when Maps has business names but no website/email yet.
+  const src = String(lead.source || '').toLowerCase();
+  if (!keys.length && nameKey && src.includes('google_maps')) keys.push('mapsname:' + nameKey);
+
+  return Array.from(new Set(keys));
+}
+
+function leadDedupeKey(lead) {
+  return allLeadDedupeKeys(lead)[0] || '';
 }
 
 function uniquePush(arr, values) {
@@ -480,11 +511,24 @@ function normalizeDorkLead(raw = {}, context = {}) {
   return {
     id: raw.id || 'lead_' + Math.random().toString(36).slice(2) + Date.now().toString(36),
     name,
-    businessName: raw.businessName || raw.business_name || name,
+    businessName: raw.businessName || raw.business_name || raw.name || name,
+    companyName: raw.companyName || raw.company_name || raw.businessName || raw.business_name || name,
     email,
     emails,
     website,
     domain,
+    placeId: raw.placeId || raw.place_id || raw.googlePlaceId || raw.google_place_id || '',
+    address: raw.address || raw.formattedAddress || raw.formatted_address || '',
+    city: raw.city || '',
+    state: raw.state || '',
+    country: raw.country || '',
+    phone: raw.phone || raw.phoneNumber || raw.phone_number || '',
+    rating: raw.rating ?? '',
+    reviews: raw.reviews ?? raw.reviewCount ?? raw.userRatingCount ?? raw.user_ratings_total ?? '',
+    category: raw.category || raw.industry || context.industry || '',
+    categories: uniquePush([], raw.categories || raw.types || []),
+    mapsUrl: raw.mapsUrl || raw.maps_url || raw.googleMapsUrl || raw.google_maps_url || '',
+    domainSource: raw.domainSource || '',
     industry: raw.industry || context.industry || '',
     location: raw.location || context.location || '',
     sourceQuery: raw.sourceQuery || raw.source_query || context.sourceQuery || '',
@@ -500,6 +544,8 @@ function normalizeDorkLead(raw = {}, context = {}) {
     addedAt: raw.addedAt || raw.createdAt || now,
     firstSeenAt: raw.firstSeenAt || raw.addedAt || now,
     lastSeenAt: raw.lastSeenAt || now,
+    importedAt: raw.importedAt || '',
+    lastEnrichedAt: raw.lastEnrichedAt || '',
     sourceCount: Number(raw.sourceCount || 1),
     status: raw.status || 'found',
     verificationStatus: raw.verificationStatus || raw.verification_status || 'needs_verification',
@@ -507,6 +553,12 @@ function normalizeDorkLead(raw = {}, context = {}) {
     verificationProvider: raw.verificationProvider || raw.verification_provider || '',
     verificationReason: raw.verificationReason || raw.verification_reason || '',
     verifiedAt: raw.verifiedAt || raw.verified_at || '',
+    leadScore: raw.leadScore || raw.lead_score || 0,
+    messageStatus: raw.messageStatus || raw.message_status || '',
+    messageTemplateId: raw.messageTemplateId || raw.message_template_id || '',
+    messageSubject: raw.messageSubject || raw.message_subject || '',
+    messageBody: raw.messageBody || raw.message_body || '',
+    messageMissingCodes: raw.messageMissingCodes || raw.message_missing_codes || [],
     readyToContact: !!(raw.readyToContact || raw.ready_to_contact),
   };
 }
@@ -514,11 +566,12 @@ function normalizeDorkLead(raw = {}, context = {}) {
 function mergeDorkLead(existing, incoming) {
   const now = new Date().toISOString();
   const merged = { ...existing };
-  ['name','businessName','website','domain','industry','location','sourceQuery','sourceSignal','sourceUrl','sourceEngine','campaignId'].forEach(k => {
+  ['name','businessName','companyName','website','domain','placeId','address','city','state','country','phone','rating','reviews','category','mapsUrl','industry','location','sourceQuery','sourceSignal','sourceUrl','sourceEngine','campaignId'].forEach(k => {
     if (!merged[k] && incoming[k]) merged[k] = incoming[k];
   });
   merged.email = existing.email || incoming.email;
   merged.emails = uniquePush(existing.emails || [], incoming.emails || incoming.email);
+  merged.categories = uniquePush(existing.categories || [], incoming.categories || incoming.category);
   merged.campaignIds = uniquePush(existing.campaignIds || [], incoming.campaignIds || incoming.campaignId);
   merged.sources = uniquePush(existing.sources || [], incoming.sources || incoming.sourceUrl || incoming.website || incoming.sourceQuery);
   merged.sourceSignals = uniquePush(existing.sourceSignals || [], incoming.sourceSignals || incoming.sourceSignal);
@@ -545,30 +598,33 @@ function saveDorkLeadBatch(incoming = [], context = {}) {
   leads.forEach((lead, idx) => {
     const normalized = normalizeDorkLead(lead, {});
     leads[idx] = { ...normalized, ...lead, id: lead.id || normalized.id };
-    const key = leadDedupeKey(leads[idx]);
-    if (key) byKey.set(key, idx);
+    for (const key of allLeadDedupeKeys(leads[idx])) byKey.set(key, idx);
   });
   let added = 0, updated = 0, duplicates = 0;
   const saved = [];
   for (const raw of incoming) {
     const lead = normalizeDorkLead(raw, context);
-    const key = leadDedupeKey(lead);
-    if (!key) continue;
-    if (byKey.has(key)) {
-      const idx = byKey.get(key);
+    const keys = allLeadDedupeKeys(lead);
+    if (!keys.length) continue;
+    const matchKey = keys.find(k => byKey.has(k));
+    if (matchKey) {
+      const idx = byKey.get(matchKey);
       leads[idx] = mergeDorkLead(leads[idx], lead);
+      for (const key of allLeadDedupeKeys(leads[idx])) byKey.set(key, idx);
       updated++;
       duplicates++;
       saved.push(leads[idx]);
     } else {
       leads.push(lead);
-      byKey.set(key, leads.length - 1);
+      const idx = leads.length - 1;
+      for (const key of keys) byKey.set(key, idx);
       added++;
       saved.push(lead);
     }
   }
-  writeJsonFile(DORK_LEADS_FILE, leads.slice(-50000));
-  return { added, updated, duplicates, total: leads.length, leads: saved };
+  const trimmed = leads.slice(-50000);
+  writeJsonFile(DORK_LEADS_FILE, trimmed);
+  return { added, updated, duplicates, total: trimmed.length, leads: saved };
 }
 
 function readCampaigns() { return readJsonFile(CAMPAIGNS_FILE, []); }
@@ -1044,8 +1100,9 @@ async function runCloudCampaign(campaignId) {
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v3.8 Multi-Engine Cloud Runner', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v4.3 Email Scout Gmail Batch Sender', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
+  browserGoogleMapsImport: { enabled: true, requiresGoogleApiKey: false, endpoint: '/leads/import-google-maps-browser' },
   emailVerifier: {
     provider: EMAIL_VERIFIER_PROVIDER || 'basic_mx',
     hasProviderKey: !!getVerifierProviderKey(EMAIL_VERIFIER_PROVIDER),
@@ -1316,6 +1373,1081 @@ app.get('/verified-leads', (req, res) => {
   res.json({ success: true, total: leads.length, leads });
 });
 
+
+// ── UNIFIED LEAD INTELLIGENCE + SMART MESSAGING ─────────────────────────────
+
+const DEFAULT_MESSAGE_TEMPLATES = [
+  {
+    id: 'maps_rich_airtable_ops',
+    name: 'Google Maps rich lead - operations pain',
+    sourceFit: ['google_maps'],
+    priority: 100,
+    subject: 'Airtable system for {name}',
+    body: 'Hi {name}, I saw your {industry} business in {location} has {rating} stars from {reviews} reviews. I help businesses replace messy spreadsheets with a simple Airtable system for leads, bookings, follow-ups, and staff tasks. Would it be useful if I showed you a simple setup for {name}?',
+  },
+  {
+    id: 'maps_standard_airtable',
+    name: 'Google Maps standard lead',
+    sourceFit: ['google_maps'],
+    priority: 90,
+    subject: 'Quick Airtable idea for {name}',
+    body: 'Hi {name}, I came across your {industry} business in {location}. I help businesses organize leads, clients, bookings, follow-ups, and daily work inside Airtable so nothing gets lost in spreadsheets or WhatsApp. Would you like me to send a quick example for {name}?',
+  },
+  {
+    id: 'website_dorking_airtable',
+    name: 'Website/dorking lead',
+    sourceFit: ['cloud_campaign', 'dorking', 'extension_or_app'],
+    priority: 80,
+    subject: 'Airtable workflow idea for {name}',
+    body: 'Hi {name}, I came across your website and noticed you offer {industry} services in {location}. I build Airtable systems that help businesses track leads, clients, bookings, tasks, and follow-ups in one simple dashboard. Is this something you would like to improve at {name}?',
+  },
+  {
+    id: 'website_light_airtable',
+    name: 'Website lead - light personalization',
+    sourceFit: ['cloud_campaign', 'dorking', 'extension_or_app', 'uploaded'],
+    priority: 70,
+    subject: 'Organizing {industry} leads in Airtable',
+    body: 'Hi, I help {industry} businesses in {location} build simple Airtable systems for lead tracking, customer follow-up, bookings, and daily operations. Would you be open to seeing a quick example?',
+  },
+  {
+    id: 'email_only_safe',
+    name: 'Email-only safe message',
+    sourceFit: ['uploaded'],
+    priority: 50,
+    subject: 'Airtable system for your operations',
+    body: 'Hi, I build simple Airtable systems that help service businesses track leads, clients, follow-ups, tasks, and operations in one place. Would you be open to seeing a quick example?',
+  },
+];
+
+const SHORTCODE_FIELDS = {
+  email: ['email'],
+  name: ['name', 'businessName', 'companyName'],
+  business_name: ['businessName', 'name', 'companyName'],
+  company: ['companyName', 'businessName', 'name'],
+  industry: ['industry', 'category'],
+  category: ['category', 'industry'],
+  location: ['location', 'city', 'address'],
+  city: ['city', 'location'],
+  address: ['address'],
+  website: ['website'],
+  domain: ['domain'],
+  phone: ['phone'],
+  rating: ['rating'],
+  reviews: ['reviews'],
+  source: ['source'],
+  sourceSignal: ['sourceSignal'],
+  sourceQuery: ['sourceQuery'],
+};
+
+function ensureDefaultTemplates() {
+  const existing = readJsonFile(MESSAGE_TEMPLATES_FILE, null);
+  if (!Array.isArray(existing) || !existing.length) {
+    writeJsonFile(MESSAGE_TEMPLATES_FILE, DEFAULT_MESSAGE_TEMPLATES);
+    return DEFAULT_MESSAGE_TEMPLATES;
+  }
+  return existing;
+}
+
+function getLeadValue(lead, code) {
+  const keys = SHORTCODE_FIELDS[code] || [code];
+  for (const key of keys) {
+    const value = lead[key];
+    if (value == null) continue;
+    if (Array.isArray(value) && value.length) return value.join(', ');
+    const clean = String(value).trim();
+    if (clean) return clean;
+  }
+  return '';
+}
+
+function getShortcodes(text) {
+  const codes = new Set();
+  String(text || '').replace(/\{([a-zA-Z0-9_]+)\}/g, (_, code) => { codes.add(code); return ''; });
+  return Array.from(codes);
+}
+
+function templateCodes(template) {
+  return Array.from(new Set([...getShortcodes(template.subject), ...getShortcodes(template.body)]));
+}
+
+function renderTemplateText(text, lead) {
+  const missing = [];
+  const rendered = String(text || '').replace(/\{([a-zA-Z0-9_]+)\}/g, (m, code) => {
+    const value = getLeadValue(lead, code);
+    if (!value) { missing.push(code); return m; }
+    return value;
+  });
+  return { rendered, missing: Array.from(new Set(missing)) };
+}
+
+function scoreLead(lead) {
+  let score = 0;
+  if (lead.email) score += 25;
+  if (lead.verificationStatus === 'valid' || lead.readyToContact) score += 30;
+  else if (lead.verificationStatus === 'catch_all') score += 15;
+  else if (lead.verificationStatus === 'risky' || lead.verificationStatus === 'needs_provider') score += 8;
+  else if (lead.verificationStatus === 'invalid') score -= 50;
+  if (lead.name || lead.businessName) score += 10;
+  if (lead.website) score += 10;
+  if (lead.industry || lead.category) score += 8;
+  if (lead.location || lead.address) score += 8;
+  if (lead.rating) score += 4;
+  if (lead.reviews) score += 4;
+  if (lead.phone) score += 3;
+  if (lead.source === 'google_maps') score += 6;
+  if (lead.isDisposable) score -= 50;
+  if (lead.verificationStatus === 'invalid') score = 0;
+  return Math.max(0, Math.min(100, score));
+}
+
+function enrichLeadComputedFields(lead) {
+  const normalized = normalizeDorkLead(lead, {});
+  normalized.leadScore = Number(lead.leadScore || 0) || scoreLead({ ...normalized, ...lead });
+  return { ...normalized, ...lead, leadScore: normalized.leadScore };
+}
+
+function templateFitsLead(template, lead) {
+  const codes = templateCodes(template);
+  const missing = codes.filter(c => !getLeadValue(lead, c));
+  const source = String(lead.source || '').toLowerCase();
+  const fit = Array.isArray(template.sourceFit) && template.sourceFit.length
+    ? template.sourceFit.some(s => source.includes(String(s).toLowerCase()) || String(s).toLowerCase() === 'any')
+    : true;
+  return { fits: missing.length === 0 && fit, missing, sourceFit: fit, codes };
+}
+
+function pickBestTemplateForLead(lead, templates) {
+  const usable = [];
+  const blocked = [];
+  for (const t of templates) {
+    const fit = templateFitsLead(t, lead);
+    if (fit.fits) usable.push({ template: t, fit }); else blocked.push({ template: t, fit });
+  }
+  usable.sort((a, b) => Number(b.template.priority || 0) - Number(a.template.priority || 0));
+  return { best: usable[0] || null, usable, blocked };
+}
+
+function buildMessageForLead(lead, templates) {
+  if (!lead.email) {
+    return { ready: false, status: 'blocked_missing_email', missingCodes: ['email'], reason: 'Lead has no email address.' };
+  }
+  if (lead.verificationStatus === 'invalid' || lead.isDisposable) {
+    return { ready: false, status: 'blocked_bad_email', missingCodes: [], reason: 'Email is invalid/disposable.' };
+  }
+  const picked = pickBestTemplateForLead(lead, templates);
+  if (!picked.best) {
+    const missing = Array.from(new Set(picked.blocked.flatMap(x => x.fit.missing))).slice(0, 20);
+    return { ready: false, status: 'blocked_missing_shortcodes', missingCodes: missing, reason: 'No compatible template for available lead data.' };
+  }
+  const template = picked.best.template;
+  const subject = renderTemplateText(template.subject, lead);
+  const body = renderTemplateText(template.body, lead);
+  const missing = Array.from(new Set([...subject.missing, ...body.missing]));
+  if (missing.length) return { ready: false, status: 'blocked_missing_shortcodes', missingCodes: missing, reason: 'Template has missing shortcodes.' };
+  return { ready: true, status: 'ready', templateId: template.id, templateName: template.name, subject: subject.rendered, body: body.rendered, missingCodes: [] };
+}
+
+function parseUploadedEmailsText(text, defaults = {}) {
+  const out = [];
+  const seen = new Set();
+  const lines = String(text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const emails = cleanEmails(new Set(line.match(/[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]+\.[a-z]{2,}/gi) || []));
+    if (!emails.length) continue;
+    for (const email of emails) {
+      const key = normalizeEmail(email);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        email: key,
+        emails: [key],
+        name: defaults.name || defaults.businessName || '',
+        industry: defaults.industry || '',
+        location: defaults.location || '',
+        source: 'uploaded',
+        importedAt: new Date().toISOString(),
+      });
+    }
+  }
+  return out;
+}
+
+function readMapCampaigns() { return readJsonFile(MAP_CAMPAIGNS_FILE, []); }
+function writeMapCampaigns(campaigns) { writeJsonFile(MAP_CAMPAIGNS_FILE, campaigns); }
+function saveMapCampaign(campaign) {
+  const campaigns = readMapCampaigns();
+  const idx = campaigns.findIndex(c => c.id === campaign.id);
+  campaign.updatedAt = new Date().toISOString();
+  if (idx >= 0) campaigns[idx] = campaign; else campaigns.unshift(campaign);
+  writeMapCampaigns(campaigns.slice(0, 200));
+  return campaign;
+}
+function getMapCampaign(id) { return readMapCampaigns().find(c => c.id === id); }
+function logMapCampaign(campaign, message) {
+  campaign.logs = Array.isArray(campaign.logs) ? campaign.logs : [];
+  campaign.logs.push({ at: new Date().toISOString(), message });
+  campaign.logs = campaign.logs.slice(-100);
+  saveMapCampaign(campaign);
+  console.log('[Maps Campaign]', campaign.id, message);
+}
+
+const runningMapCampaigns = new Map();
+
+function normalizeMapsCampaignPayload(body = {}) {
+  const industry = String(body.industry || body.category || body.businessType || '').trim();
+  const location = String(body.location || body.city || '').trim();
+  const targetEmailsRaw = parseInt(body.targetEmails || body.target_emails || body.maxEmails || 100, 10);
+  const maxPlacesRaw = parseInt(body.maxPlaces || body.max_places || Math.max(targetEmailsRaw * 3, 40), 10);
+  return {
+    id: body.id || 'maps_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+    name: body.name || `${industry || 'Businesses'} in ${location || 'selected market'}`,
+    type: 'google_maps_email_campaign',
+    status: 'queued',
+    industry,
+    location,
+    query: String(body.query || `${industry} in ${location}`).trim(),
+    targetEmails: Math.max(1, Math.min(10000, Number.isFinite(targetEmailsRaw) ? targetEmailsRaw : 100)),
+    maxPlaces: Math.max(1, Math.min(2000, Number.isFinite(maxPlacesRaw) ? maxPlacesRaw : 200)),
+    delayBetweenPlaces: Math.max(250, Math.min(60000, parseInt(body.delayBetweenPlaces || body.delay_between_places || 1000, 10) || 1000)),
+    verifyWhileRunning: !!body.verifyWhileRunning,
+    createdAt: new Date().toISOString(),
+    startedAt: '',
+    finishedAt: '',
+    updatedAt: new Date().toISOString(),
+    placesFound: 0,
+    placesChecked: 0,
+    websitesCrawled: 0,
+    emailsFound: 0,
+    newEmailsAdded: 0,
+    duplicatesSkipped: 0,
+    errors: 0,
+    currentPlace: '',
+    currentWebsite: '',
+    stopRequested: false,
+    logs: [],
+  };
+}
+
+async function googlePlacesTextSearch(query, maxPlaces = 60) {
+  if (!GMAPS_KEY) throw new Error('GOOGLE_MAPS_API_KEY is not set on backend. Add it in Render environment variables.');
+  const places = [];
+  let pageToken = '';
+  for (let page = 0; page < 3 && places.length < maxPlaces; page++) {
+    if (pageToken) await new Promise(r => setTimeout(r, 2200));
+    const url = pageToken
+      ? `https://maps.googleapis.com/maps/api/place/textsearch/json?pagetoken=${encodeURIComponent(pageToken)}&key=${encodeURIComponent(GMAPS_KEY)}`
+      : `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${encodeURIComponent(GMAPS_KEY)}`;
+    const r = await axios.get(url, { timeout: 15000, validateStatus: s => s < 500 });
+    if (r.data?.status && !['OK','ZERO_RESULTS'].includes(r.data.status)) {
+      throw new Error(`Google Places Text Search error: ${r.data.status} ${r.data.error_message || ''}`.trim());
+    }
+    (r.data?.results || []).forEach(p => places.push(p));
+    pageToken = r.data?.next_page_token || '';
+    if (!pageToken || r.data?.status === 'ZERO_RESULTS') break;
+  }
+  return places.slice(0, maxPlaces);
+}
+
+async function runGoogleMapsCampaign(campaignId) {
+  if (runningMapCampaigns.has(campaignId)) return;
+  let campaign = getMapCampaign(campaignId);
+  if (!campaign) return;
+  runningMapCampaigns.set(campaignId, { startedAt: Date.now() });
+  campaign.status = 'running';
+  campaign.startedAt = campaign.startedAt || new Date().toISOString();
+  saveMapCampaign(campaign);
+  logMapCampaign(campaign, 'Google Maps campaign started.');
+  try {
+    const queries = Array.from(new Set([
+      campaign.query,
+      `${campaign.industry} near ${campaign.location}`,
+      `best ${campaign.industry} ${campaign.location}`,
+      `${campaign.industry} services ${campaign.location}`,
+    ].map(q => String(q || '').trim()).filter(Boolean)));
+
+    const seenPlaces = new Set();
+    for (const query of queries) {
+      campaign = getMapCampaign(campaignId) || campaign;
+      if (campaign.stopRequested || campaign.status === 'stopping') break;
+      logMapCampaign(campaign, `Searching Google Maps: ${query}`);
+      let places = [];
+      try { places = await googlePlacesTextSearch(query, campaign.maxPlaces); }
+      catch (e) { campaign.errors++; logMapCampaign(campaign, e.message); saveMapCampaign(campaign); continue; }
+      campaign.placesFound += places.length;
+      saveMapCampaign(campaign);
+
+      for (const p of places) {
+        campaign = getMapCampaign(campaignId) || campaign;
+        if (campaign.stopRequested || campaign.status === 'stopping') break;
+        if (campaign.newEmailsAdded >= campaign.targetEmails || campaign.placesChecked >= campaign.maxPlaces) break;
+        const pid = p.place_id || '';
+        if (pid && seenPlaces.has(pid)) continue;
+        if (pid) seenPlaces.add(pid);
+        campaign.currentPlace = p.name || pid || '';
+        saveMapCampaign(campaign);
+
+        try {
+          const details = pid ? await getPlaceDetails(pid) : {};
+          const website = details.website || '';
+          let er = { emails: [], phones: [], reached: 0 };
+          if (website) {
+            campaign.currentWebsite = website;
+            saveMapCampaign(campaign);
+            er = await crawlSiteForEmail(website);
+            campaign.websitesCrawled++;
+          }
+          campaign.placesChecked++;
+          campaign.emailsFound += (er.emails || []).length;
+
+          const baseLead = {
+            placeId: pid,
+            name: details.name || p.name || '',
+            businessName: details.name || p.name || '',
+            website,
+            phone: details.phone || (er.phones || [])[0] || '',
+            address: details.address || p.formatted_address || '',
+            rating: details.rating ?? p.rating ?? '',
+            reviews: details.reviews ?? p.user_ratings_total ?? '',
+            category: campaign.industry,
+            categories: p.types || [],
+            industry: campaign.industry,
+            location: campaign.location,
+            mapsUrl: pid ? `https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(pid)}` : '',
+            source: 'google_maps',
+            sourceQuery: query,
+            sourceSignal: `${campaign.industry} ${campaign.location}`,
+            campaignId: campaign.id,
+          };
+
+          const leadRows = (er.emails && er.emails.length ? er.emails : ['']).map(email => ({ ...baseLead, email, emails: email ? [email] : [] }));
+          if (campaign.verifyWhileRunning) {
+            for (let i = 0; i < leadRows.length; i++) {
+              if (!leadRows[i].email) continue;
+              const result = await verifyEmailAddress(leadRows[i].email);
+              leadRows[i] = applyVerificationToLead(leadRows[i], result);
+            }
+          }
+          const saved = saveDorkLeadBatch(leadRows, { source: 'google_maps', campaignId: campaign.id, industry: campaign.industry, location: campaign.location });
+          campaign.newEmailsAdded += saved.leads.filter(l => l.email).length ? saved.added : 0;
+          campaign.duplicatesSkipped += saved.duplicates;
+          logMapCampaign(campaign, `${baseLead.name || 'Place'}: ${er.emails?.length || 0} email(s), ${saved.added} new, ${saved.duplicates} duplicate/merged.`);
+        } catch (e) {
+          campaign.errors++;
+          logMapCampaign(campaign, `Place failed: ${campaign.currentPlace} — ${e.message}`);
+        }
+        saveMapCampaign(campaign);
+        await new Promise(r => setTimeout(r, campaign.delayBetweenPlaces));
+      }
+      if (campaign.newEmailsAdded >= campaign.targetEmails || campaign.placesChecked >= campaign.maxPlaces) break;
+    }
+    campaign = getMapCampaign(campaignId) || campaign;
+    campaign.status = campaign.stopRequested || campaign.status === 'stopping' ? 'stopped' : 'completed';
+    campaign.finishedAt = new Date().toISOString();
+    campaign.currentPlace = '';
+    campaign.currentWebsite = '';
+    saveMapCampaign(campaign);
+    logMapCampaign(campaign, `Campaign ${campaign.status}. Added ${campaign.newEmailsAdded} unique email leads. Duplicates merged: ${campaign.duplicatesSkipped}.`);
+  } catch (e) {
+    campaign = getMapCampaign(campaignId) || campaign;
+    campaign.status = 'failed';
+    campaign.finishedAt = new Date().toISOString();
+    campaign.errors++;
+    logMapCampaign(campaign, 'Campaign failed: ' + e.message);
+  } finally {
+    runningMapCampaigns.delete(campaignId);
+  }
+}
+
+// Unified lead routes
+app.get('/lead-schema', (req, res) => {
+  res.json({ success: true, shortcodes: Object.keys(SHORTCODE_FIELDS), fields: SHORTCODE_FIELDS, examples: ['{name}', '{industry}', '{location}', '{rating}', '{reviews}', '{website}', '{email}'] });
+});
+
+app.get('/leads', (req, res) => {
+  let leads = readJsonFile(DORK_LEADS_FILE, []).map(enrichLeadComputedFields);
+  const source = String(req.query.source || '').toLowerCase();
+  const ready = String(req.query.ready || '').toLowerCase();
+  const q = String(req.query.q || '').toLowerCase();
+  if (source) leads = leads.filter(l => String(l.source || '').toLowerCase().includes(source));
+  if (ready === 'true' || ready === '1') leads = leads.filter(l => l.readyToContact || l.messageStatus === 'ready');
+  if (q) leads = leads.filter(l => JSON.stringify(l).toLowerCase().includes(q));
+  leads = leads.sort((a,b) => String(b.lastSeenAt || b.updatedAt || b.addedAt || '').localeCompare(String(a.lastSeenAt || a.updatedAt || a.addedAt || '')));
+  const limit = Math.max(1, Math.min(50000, parseInt(req.query.limit || leads.length || 1000, 10)));
+  const out = leads.slice(0, limit);
+  if (req.query.format === 'csv') {
+    const headers = ['name','email','phone','website','industry','location','address','rating','reviews','source','verificationStatus','leadScore','messageStatus','messageTemplateId','messageSubject','messageBody','sourceQuery','sourceSignal','addedAt','lastSeenAt'];
+    const lines = [headers.map(csvEscape).join(',')];
+    out.forEach(l => lines.push(headers.map(h => csvEscape(Array.isArray(l[h]) ? l[h].join('; ') : l[h])).join(',')));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="unified-leads.csv"');
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.json({ success: true, total: leads.length, returned: out.length, leads: out, serverTime: new Date().toISOString() });
+});
+
+app.get('/leads/summary', (req, res) => {
+  const leads = readJsonFile(DORK_LEADS_FILE, []).map(enrichLeadComputedFields);
+  const bySource = {};
+  const byVerification = {};
+  leads.forEach(l => {
+    const s = l.source || 'unknown'; bySource[s] = (bySource[s] || 0) + 1;
+    const v = l.readyToContact ? 'ready' : (l.verificationStatus || 'needs_verification'); byVerification[v] = (byVerification[v] || 0) + 1;
+  });
+  res.json({ success: true, total: leads.length, withEmail: leads.filter(l => l.email).length, readyMessages: leads.filter(l => l.messageStatus === 'ready').length, readyToContact: leads.filter(l => l.readyToContact).length, bySource, byVerification });
+});
+
+app.post('/leads/upsert', (req, res) => {
+  const incoming = Array.isArray(req.body?.leads) ? req.body.leads : (req.body?.lead ? [req.body.lead] : []);
+  if (!incoming.length) return res.status(400).json({ error: 'lead or leads array required' });
+  const result = saveDorkLeadBatch(incoming, { source: 'api_upsert' });
+  res.json({ success: true, ...result });
+});
+
+app.post('/leads/import-uploaded', (req, res) => {
+  const defaults = { industry: req.body?.industry || '', location: req.body?.location || '' };
+  let incoming = [];
+  if (Array.isArray(req.body?.leads)) incoming = req.body.leads.map(l => ({ ...l, source: l.source || 'uploaded', importedAt: new Date().toISOString(), industry: l.industry || defaults.industry, location: l.location || defaults.location }));
+  else if (Array.isArray(req.body?.emails)) incoming = req.body.emails.map(email => ({ email, emails: [email], source: 'uploaded', importedAt: new Date().toISOString(), ...defaults }));
+  else incoming = parseUploadedEmailsText(req.body?.text || req.body?.csv || '', defaults);
+  if (!incoming.length) return res.status(400).json({ error: 'No valid emails found. Send text/csv, emails[], or leads[].' });
+  const result = saveDorkLeadBatch(incoming, { source: 'uploaded', industry: defaults.industry, location: defaults.location });
+  res.json({ success: true, imported: incoming.length, ...result });
+});
+
+
+// ── BROWSER GOOGLE MAPS IMPORT (NO GOOGLE API KEY REQUIRED) ─────────────────
+// This endpoint accepts rows collected by the Chrome extension from a live Google Maps page.
+// It preserves the old no-API workflow: Maps page → extension extracts business name/rating/reviews/website → backend crawls website for email → unified leads.
+
+function parseCsvRows(text) {
+  const raw = String(text || '').replace(/^\ufeff/, '');
+  if (!raw.trim()) return [];
+  const rows = [];
+  let row = [], cell = '', q = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i], next = raw[i + 1];
+    if (q) {
+      if (ch === '"' && next === '"') { cell += '"'; i++; }
+      else if (ch === '"') q = false;
+      else cell += ch;
+    } else {
+      if (ch === '"') q = true;
+      else if (ch === ',') { row.push(cell); cell = ''; }
+      else if (ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+      else if (ch === '\r') {}
+      else cell += ch;
+    }
+  }
+  row.push(cell); rows.push(row);
+  const header = rows.shift() || [];
+  const keys = header.map(h => String(h || '').trim());
+  return rows.filter(r => r.some(c => String(c || '').trim())).map(r => {
+    const o = {};
+    keys.forEach((k, i) => { o[k] = r[i] || ''; });
+    return o;
+  });
+}
+
+function splitEmailsAny(v) {
+  const vals = Array.isArray(v) ? v : String(v || '').split(/[;,\s]+/);
+  return cleanEmails(new Set(vals.filter(Boolean)));
+}
+
+function firstNonEmpty(obj, keys) {
+  for (const k of keys) {
+    if (obj[k] != null && String(obj[k]).trim()) return String(obj[k]).trim();
+  }
+  return '';
+}
+
+function normalizeBrowserMapRow(row = {}, defaults = {}) {
+  const name = firstNonEmpty(row, ['name','Name','Business','business','businessName','Business Name','company','Company']);
+  const website = normalizeUrl(firstNonEmpty(row, ['website','Website','url','URL','Business Website']));
+  const mapsUrl = firstNonEmpty(row, ['mapsUrl','maps_url','googleMapsUrl','Google Maps URL','Profile link','Profile Link','profile','Profile','url']);
+  const placeId = firstNonEmpty(row, ['placeId','place_id','Place ID','Google Place ID']);
+  const address = firstNonEmpty(row, ['address','Address','formattedAddress','Formatted Address']);
+  const phone = firstNonEmpty(row, ['phone','Phone','Phone Number','telephone']);
+  const rating = firstNonEmpty(row, ['rating','Rating']);
+  const reviews = firstNonEmpty(row, ['reviews','Reviews','reviewCount','Review Count','count','Count']);
+  const email = firstNonEmpty(row, ['email','Email','emails','Emails']);
+  const emails = splitEmailsAny(email);
+  const lead = {
+    name,
+    businessName: name,
+    companyName: name,
+    email: emails[0] || '',
+    emails,
+    website,
+    placeId,
+    address,
+    phone,
+    rating,
+    reviews,
+    mapsUrl,
+    industry: row.industry || row.Industry || defaults.industry || '',
+    location: row.location || row.Location || row.city || row.City || defaults.location || '',
+    category: row.category || row.Category || row.industry || row.Industry || defaults.industry || '',
+    source: 'google_maps_browser',
+    sourceEngine: 'browser_extension',
+    sourceUrl: mapsUrl || website,
+    sourceQuery: defaults.sourceQuery || `${defaults.industry || ''} ${defaults.location || ''}`.trim(),
+    sourceSignal: 'google_maps_browser',
+    importedAt: new Date().toISOString(),
+  };
+  return lead;
+}
+
+app.post('/leads/import-google-maps-browser', async (req, res) => {
+  const defaults = { industry: req.body?.industry || '', location: req.body?.location || '', sourceQuery: req.body?.sourceQuery || '' };
+  let rows = [];
+  if (Array.isArray(req.body?.rows)) rows = req.body.rows;
+  else if (Array.isArray(req.body?.businesses)) rows = req.body.businesses;
+  else if (Array.isArray(req.body?.leads)) rows = req.body.leads;
+  else if (req.body?.csv || req.body?.text) rows = parseCsvRows(req.body.csv || req.body.text);
+
+  if (!rows.length) return res.status(400).json({ error: 'No Google Maps browser rows found. Send rows[], businesses[], leads[], or csv/text.' });
+
+  const limit = Math.max(1, Math.min(1000, parseInt(req.body?.limit || rows.length, 10) || rows.length));
+  const crawlWebsites = req.body?.crawlWebsites !== false;
+  const inputRows = rows.slice(0, limit);
+  const incoming = [];
+  let websitesCrawled = 0, emailsFound = 0, rowsWithWebsite = 0, rowsWithEmail = 0;
+
+  for (const raw of inputRows) {
+    const lead = normalizeBrowserMapRow(raw, defaults);
+    if (lead.website) rowsWithWebsite++;
+    if (lead.email || (lead.emails && lead.emails.length)) rowsWithEmail++;
+
+    if (crawlWebsites && lead.website && !(lead.emails && lead.emails.length)) {
+      const er = await crawlSiteForEmail(lead.website);
+      websitesCrawled++;
+      if (er.emails && er.emails.length) {
+        lead.email = er.emails[0];
+        lead.emails = er.emails;
+        emailsFound += er.emails.length;
+      }
+      if (!lead.phone && er.phones && er.phones.length) lead.phone = er.phones[0];
+      lead.websitePagesReached = er.reached || 0;
+      lead.lastEnrichedAt = new Date().toISOString();
+    } else if (lead.emails && lead.emails.length) {
+      emailsFound += lead.emails.length;
+    }
+
+    // Save even if email not found yet; later dorking/email crawl can merge into the same business by website/place/name+location.
+    incoming.push(lead);
+  }
+
+  const result = saveDorkLeadBatch(incoming, { source: 'google_maps_browser', industry: defaults.industry, location: defaults.location, sourceEngine: 'browser_extension' });
+  res.json({
+    success: true,
+    mode: 'browser_google_maps_no_api_key',
+    importedBusinesses: inputRows.length,
+    rowsWithWebsite,
+    rowsWithEmail,
+    crawlWebsites,
+    websitesCrawled,
+    emailsFound,
+    ...result,
+  });
+});
+
+// Message template routes
+app.get('/message-templates', (req, res) => res.json({ success: true, templates: ensureDefaultTemplates() }));
+
+app.post('/message-templates', (req, res) => {
+  const current = ensureDefaultTemplates();
+  const incoming = Array.isArray(req.body?.templates) ? req.body.templates : (req.body?.template ? [req.body.template] : []);
+  if (!incoming.length) return res.status(400).json({ error: 'template or templates[] required' });
+  const byId = new Map(current.map(t => [t.id, t]));
+  incoming.forEach(t => {
+    const id = t.id || 'tpl_' + Math.random().toString(36).slice(2, 8);
+    byId.set(id, { ...t, id, priority: Number(t.priority || 50) });
+  });
+  const templates = Array.from(byId.values());
+  writeJsonFile(MESSAGE_TEMPLATES_FILE, templates);
+  res.json({ success: true, templates });
+});
+
+app.post('/message-templates/reset-defaults', (req, res) => {
+  writeJsonFile(MESSAGE_TEMPLATES_FILE, DEFAULT_MESSAGE_TEMPLATES);
+  res.json({ success: true, templates: DEFAULT_MESSAGE_TEMPLATES });
+});
+
+app.post('/messages/preview', (req, res) => {
+  const lead = enrichLeadComputedFields(req.body?.lead || {});
+  const template = req.body?.template || ensureDefaultTemplates().find(t => t.id === req.body?.templateId) || ensureDefaultTemplates()[0];
+  const subject = renderTemplateText(template.subject, lead);
+  const body = renderTemplateText(template.body, lead);
+  const missingCodes = Array.from(new Set([...subject.missing, ...body.missing]));
+  res.json({ success: true, ready: missingCodes.length === 0 && !!lead.email, missingCodes, subject: subject.rendered, body: body.rendered, template });
+});
+
+app.post('/leads/prepare-messages', (req, res) => {
+  const templates = Array.isArray(req.body?.templates) && req.body.templates.length ? req.body.templates : ensureDefaultTemplates();
+  const limit = Math.max(1, Math.min(50000, parseInt(req.body?.limit || 5000, 10)));
+  const onlyReadyEmails = req.body?.onlyReadyEmails !== false;
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  let prepared = 0, blocked = 0;
+  for (let i = 0; i < leads.length && prepared + blocked < limit; i++) {
+    const lead = enrichLeadComputedFields(leads[i]);
+    if (onlyReadyEmails && lead.email && lead.verificationStatus === 'invalid') continue;
+    const message = buildMessageForLead(lead, templates);
+    leads[i] = {
+      ...lead,
+      messageStatus: message.status,
+      messageTemplateId: message.templateId || '',
+      messageSubject: message.subject || '',
+      messageBody: message.body || '',
+      messageMissingCodes: message.missingCodes || [],
+      messageReason: message.reason || '',
+      leadScore: scoreLead(lead),
+      readyToContact: !!(lead.readyToContact || (message.ready && lead.email && !['invalid'].includes(lead.verificationStatus))),
+      preparedAt: new Date().toISOString(),
+    };
+    if (message.ready) prepared++; else blocked++;
+  }
+  writeJsonFile(DORK_LEADS_FILE, leads);
+  res.json({ success: true, prepared, blocked, total: leads.length });
+});
+
+app.get('/ready-messages', (req, res) => {
+  const leads = readJsonFile(DORK_LEADS_FILE, []).map(enrichLeadComputedFields).filter(l => l.email && l.messageStatus === 'ready' && l.messageBody && l.messageSubject);
+  if (req.query.format === 'csv') {
+    const headers = ['email','subject','message','name','industry','location','website','phone','rating','reviews','source','verificationStatus','leadScore'];
+    const lines = [headers.map(csvEscape).join(',')];
+    leads.forEach(l => lines.push([
+      l.email, l.messageSubject, l.messageBody, l.name || l.businessName, l.industry, l.location, l.website, l.phone, l.rating, l.reviews, l.source, l.verificationStatus, l.leadScore
+    ].map(csvEscape).join(',')));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="ready-airtable-messages.csv"');
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.json({ success: true, total: leads.length, leads });
+});
+
+
+
+// ── EMAIL SCOUT VERIFY → READY QUEUE ────────────────────────────────────────
+// This prepares leads for the Email Scout tab. It does NOT send emails by itself.
+// Sending still requires a separate sender integration or a manual review/send step.
+function emailScoutLeadCanBePrepared(lead, opts = {}) {
+  if (!lead || !lead.email) return { ok: false, reason: 'missing_email' };
+  const status = String(lead.verificationStatus || '').toLowerCase();
+  const allowRisky = !!opts.allowRisky;
+  const allowNeedsProvider = !!opts.allowNeedsProvider;
+  if (lead.isDisposable || status === 'invalid') return { ok: false, reason: 'invalid_or_disposable' };
+  if (lead.readyToContact || status === 'valid' || status === 'deliverable') return { ok: true, reason: 'verified_ready' };
+  if (allowRisky && ['catch_all','risky','unknown'].includes(status)) return { ok: true, reason: 'allowed_risky' };
+  if (allowNeedsProvider && ['needs_provider','needs_verification',''].includes(status)) return { ok: true, reason: 'allowed_basic_verification' };
+  return { ok: false, reason: status ? `not_ready_${status}` : 'not_verified' };
+}
+
+function emailScoutRow(lead) {
+  return {
+    id: lead.id || '',
+    email: lead.email || '',
+    subject: lead.messageSubject || '',
+    message: lead.messageBody || '',
+    name: lead.name || lead.businessName || '',
+    businessName: lead.businessName || lead.name || '',
+    industry: lead.industry || lead.category || '',
+    location: lead.location || '',
+    website: lead.website || '',
+    phone: lead.phone || '',
+    rating: lead.rating || '',
+    reviews: lead.reviews || '',
+    source: lead.source || '',
+    sourceUrl: lead.sourceUrl || lead.mapsUrl || lead.website || '',
+    verificationStatus: lead.verificationStatus || '',
+    verificationScore: lead.verificationScore ?? '',
+    leadScore: lead.leadScore ?? '',
+    messageTemplateId: lead.messageTemplateId || '',
+    messageTemplateName: lead.messageTemplateName || '',
+    contactStatus: lead.contactStatus || 'ready',
+    readyAt: lead.readyAt || lead.preparedAt || '',
+  };
+}
+
+function getEmailScoutReadyLeads(options = {}) {
+  const includeSent = !!options.includeSent;
+  return readJsonFile(DORK_LEADS_FILE, [])
+    .map(enrichLeadComputedFields)
+    .filter(l => {
+      if (!l.email || !l.emailScoutReady || l.messageStatus !== 'ready' || !l.messageSubject || !l.messageBody) return false;
+      if (!includeSent && String(l.contactStatus || '').toLowerCase() === 'sent') return false;
+      return true;
+    })
+    .sort((a,b) => String(b.readyAt || b.preparedAt || b.lastSeenAt || '').localeCompare(String(a.readyAt || a.preparedAt || a.lastSeenAt || '')));
+}
+
+app.get('/email-scout/summary', (req, res) => {
+  const leads = readJsonFile(DORK_LEADS_FILE, []).map(enrichLeadComputedFields);
+  const ready = leads.filter(l => l.emailScoutReady && l.messageStatus === 'ready' && l.messageBody && String(l.contactStatus || '').toLowerCase() !== 'sent').length;
+  const readyIncludingSent = leads.filter(l => l.emailScoutReady && l.messageStatus === 'ready' && l.messageBody).length;
+  const verified = leads.filter(l => l.readyToContact || l.verificationStatus === 'valid').length;
+  const needsVerification = leads.filter(l => l.email && !l.verificationStatus && !l.readyToContact).length;
+  const invalid = leads.filter(l => l.verificationStatus === 'invalid' || l.isDisposable).length;
+  const blockedMissingCodes = leads.filter(l => l.messageStatus === 'blocked_missing_shortcodes').length;
+  const sent = leads.filter(l => l.contactStatus === 'sent').length;
+  res.json({ success: true, total: leads.length, withEmail: leads.filter(l => l.email).length, verified, needsVerification, invalid, ready, readyIncludingSent, blockedMissingCodes, sent });
+});
+
+app.post('/email-scout/verify-and-prepare', async (req, res) => {
+  const provider = req.body?.provider;
+  const limit = Math.max(1, Math.min(50000, parseInt(req.body?.limit || 1000, 10) || 1000));
+  const verifyLimit = Math.max(1, Math.min(limit, parseInt(req.body?.verifyLimit || limit, 10) || limit));
+  const onlyUnverified = req.body?.onlyUnverified !== false;
+  const allowRisky = !!req.body?.allowRisky;
+  const allowNeedsProvider = !!req.body?.allowNeedsProvider;
+  const minLeadScore = Math.max(0, Math.min(100, parseInt(req.body?.minLeadScore || 50, 10) || 50));
+  const templates = Array.isArray(req.body?.templates) && req.body.templates.length ? req.body.templates : ensureDefaultTemplates();
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  let checked = 0, verified = 0, prepared = 0, blocked = 0, skipped = 0;
+  const now = new Date().toISOString();
+
+  for (let i = 0; i < leads.length && (checked + prepared + blocked + skipped) < limit; i++) {
+    let lead = enrichLeadComputedFields(leads[i]);
+    if (!lead.email) { skipped++; continue; }
+
+    if ((!onlyUnverified || !lead.verificationStatus) && checked < verifyLimit) {
+      try {
+        const result = await verifyEmailAddress(lead.email, provider);
+        lead = applyVerificationToLead(lead, result);
+        checked++;
+        if (result.status === 'valid' || result.readyToContact) verified++;
+      } catch (e) {
+        lead.verificationStatus = lead.verificationStatus || 'unknown';
+        lead.verificationReason = lead.verificationReason || (e.message || String(e));
+      }
+    }
+
+    const gate = emailScoutLeadCanBePrepared(lead, { allowRisky, allowNeedsProvider });
+    if (!gate.ok) {
+      lead.emailScoutReady = false;
+      lead.emailScoutStatus = 'blocked_' + gate.reason;
+      lead.emailScoutReason = gate.reason;
+      leads[i] = { ...leads[i], ...lead, updatedAt: now };
+      blocked++;
+      continue;
+    }
+
+    const message = buildMessageForLead(lead, templates);
+    const computedScore = scoreLead(lead);
+    if (computedScore < minLeadScore) {
+      lead.emailScoutReady = false;
+      lead.emailScoutStatus = 'blocked_low_score';
+      lead.emailScoutReason = `Lead score ${computedScore} is below minimum ${minLeadScore}.`;
+      lead.leadScore = computedScore;
+      leads[i] = { ...leads[i], ...lead, updatedAt: now };
+      blocked++;
+      continue;
+    }
+
+    lead = {
+      ...lead,
+      messageStatus: message.status,
+      messageTemplateId: message.templateId || '',
+      messageTemplateName: message.templateName || '',
+      messageSubject: message.subject || '',
+      messageBody: message.body || '',
+      messageMissingCodes: message.missingCodes || [],
+      messageReason: message.reason || '',
+      leadScore: computedScore,
+      readyToContact: !!(lead.readyToContact || message.ready),
+      emailScoutReady: !!message.ready,
+      emailScoutStatus: message.ready ? 'ready' : message.status,
+      emailScoutReason: message.ready ? 'Prepared for Email Scout ready queue.' : (message.reason || message.status),
+      contactStatus: lead.contactStatus || (message.ready ? 'ready' : ''),
+      readyAt: message.ready ? (lead.readyAt || now) : lead.readyAt,
+      preparedAt: now,
+      updatedAt: now,
+    };
+    leads[i] = { ...leads[i], ...lead };
+    if (message.ready) prepared++; else blocked++;
+  }
+
+  writeJsonFile(DORK_LEADS_FILE, leads);
+  const ready = getEmailScoutReadyLeads();
+  res.json({ success: true, checked, verified, prepared, blocked, skipped, ready: ready.length, total: leads.length, note: 'Prepared leads are added to Email Scout ready queue only. This endpoint does not send emails.' });
+});
+
+app.get('/email-scout/ready', (req, res) => {
+  const leads = getEmailScoutReadyLeads();
+  const limit = Math.max(1, Math.min(50000, parseInt(req.query.limit || leads.length || 1000, 10) || 1000));
+  const out = leads.slice(0, limit).map(emailScoutRow);
+  if (req.query.format === 'csv') {
+    const headers = ['email','subject','message','name','businessName','industry','location','website','phone','rating','reviews','source','sourceUrl','verificationStatus','verificationScore','leadScore','messageTemplateId','messageTemplateName','contactStatus','readyAt'];
+    const lines = [headers.map(csvEscape).join(',')];
+    out.forEach(row => lines.push(headers.map(h => csvEscape(row[h])).join(',')));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="email-scout-ready.csv"');
+    return res.send('\ufeff' + lines.join('\r\n'));
+  }
+  res.json({ success: true, total: leads.length, returned: out.length, leads: out, note: 'Ready queue only. No automatic email sending is performed by this endpoint.' });
+});
+
+app.get('/email-scout/export-ready', (req, res) => {
+  const leads = getEmailScoutReadyLeads();
+  const rows = leads.map(emailScoutRow);
+  const headers = ['email','subject','message','name','businessName','industry','location','website','phone','rating','reviews','source','sourceUrl','verificationStatus','verificationScore','leadScore','messageTemplateId','messageTemplateName','contactStatus','readyAt'];
+  const lines = [headers.map(csvEscape).join(',')];
+  rows.forEach(row => lines.push(headers.map(h => csvEscape(row[h])).join(',')));
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="email-scout-ready.csv"');
+  return res.send('\ufeff' + lines.join('\r\n'));
+});
+
+app.post('/email-scout/mark-sent', (req, res) => {
+  const emails = new Set((Array.isArray(req.body?.emails) ? req.body.emails : []).map(normalizeEmail).filter(Boolean));
+  const ids = new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(String));
+  if (!emails.size && !ids.size) return res.status(400).json({ error: 'emails[] or ids[] required' });
+  const leads = readJsonFile(DORK_LEADS_FILE, []);
+  let updated = 0;
+  const now = new Date().toISOString();
+  for (let i = 0; i < leads.length; i++) {
+    const email = normalizeEmail(leads[i].email || (Array.isArray(leads[i].emails) ? leads[i].emails[0] : ''));
+    if ((email && emails.has(email)) || ids.has(String(leads[i].id || ''))) {
+      leads[i] = { ...leads[i], contactStatus: 'sent', sentAt: now, updatedAt: now };
+      updated++;
+    }
+  }
+  writeJsonFile(DORK_LEADS_FILE, leads);
+  res.json({ success: true, updated, note: 'Marked as sent. This does not send emails.' });
+});
+
+
+// ── EMAIL SCOUT GMAIL BATCH SENDER ──────────────────────────────────────────
+// Sends prepared Email Scout ready messages through a user-connected Gmail OAuth token.
+// This uses the Gmail API, not browser clicking. The user must connect Gmail and choose
+// a batch limit before sending.
+function base64UrlEncode(input) {
+  return Buffer.from(String(input), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function mimeHeader(value) {
+  const v = String(value || '');
+  if (/^[\x00-\x7F]*$/.test(v)) return v.replace(/[\r\n]+/g, ' ');
+  return '=?UTF-8?B?' + Buffer.from(v, 'utf8').toString('base64') + '?=';
+}
+
+function buildGmailRawMessage({ to, from, subject, body }) {
+  const lines = [
+    from ? `From: ${from}` : '',
+    `To: ${to}`,
+    `Subject: ${mimeHeader(subject || '')}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    String(body || '')
+  ].filter((line, idx) => idx > 6 || line !== '');
+  return base64UrlEncode(lines.join('\r\n'));
+}
+
+async function refreshGmailAccessTokenForSend({ refresh_token, client_id }) {
+  if (!refresh_token || !client_id) throw new Error('refresh_token and client_id are required when access_token is missing or expired.');
+  const client_secret = process.env.GOOGLE_CLIENT_SECRET || '';
+  if (!client_secret) throw new Error('GOOGLE_CLIENT_SECRET not set on server. Add it to Render environment variables.');
+  const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+    refresh_token,
+    client_id,
+    client_secret,
+    grant_type: 'refresh_token',
+  }, { headers: { 'Content-Type': 'application/json' } });
+  return tokenRes.data.access_token;
+}
+
+async function getGmailProfile(accessToken) {
+  try {
+    const r = await axios.get('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+      headers: { Authorization: 'Bearer ' + accessToken }
+    });
+    return r.data || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+async function sendGmailApiMessage(accessToken, row, fromEmail) {
+  const raw = buildGmailRawMessage({
+    to: row.email,
+    from: fromEmail || '',
+    subject: row.messageSubject || row.subject || '',
+    body: row.messageBody || row.message || ''
+  });
+  const r = await axios.post('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', { raw }, {
+    headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' }
+  });
+  return r.data || {};
+}
+
+function normalizeSendBatchLimit(v) {
+  const n = parseInt(v || 50, 10);
+  if (!Number.isFinite(n)) return 50;
+  return Math.max(1, Math.min(500, n));
+}
+
+function markLeadSendResult(leads, leadId, email, patch) {
+  const norm = normalizeEmail(email);
+  let updated = 0;
+  for (let i = 0; i < leads.length; i++) {
+    const lEmail = normalizeEmail(leads[i].email || (Array.isArray(leads[i].emails) ? leads[i].emails[0] : ''));
+    if ((leadId && String(leads[i].id || '') === String(leadId)) || (norm && lEmail === norm)) {
+      leads[i] = { ...leads[i], ...patch, updatedAt: new Date().toISOString() };
+      updated++;
+      break;
+    }
+  }
+  return updated;
+}
+
+app.post('/email-scout/send-batch', async (req, res) => {
+  const body = req.body || {};
+  const limit = normalizeSendBatchLimit(body.limit || body.sendLimit);
+  const delayMs = Math.max(0, Math.min(60000, parseInt(body.delayMs || 1500, 10) || 1500));
+  const dryRun = !!body.dryRun;
+  const senderEmailInput = String(body.senderEmail || body.fromEmail || '').trim();
+  const batchId = 'gmail_batch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  let accessToken = body.access_token || body.accessToken || '';
+  const refreshToken = body.refresh_token || body.refreshToken || '';
+  const clientId = body.client_id || body.clientId || process.env.GOOGLE_CLIENT_ID || '';
+
+  if (!accessToken && !refreshToken) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing Gmail OAuth token.',
+      required: 'Send access_token or refresh_token + client_id from the connected Gmail account.',
+    });
+  }
+
+  try {
+    if (!accessToken && refreshToken) {
+      accessToken = await refreshGmailAccessTokenForSend({ refresh_token: refreshToken, client_id: clientId });
+    }
+    const profile = accessToken ? await getGmailProfile(accessToken) : {};
+    const actualSenderEmail = profile.emailAddress || senderEmailInput || 'connected-gmail-account';
+    const ready = getEmailScoutReadyLeads({ includeSent: false }).slice(0, limit);
+    if (!ready.length) return res.json({ success: true, batchId, senderEmail: actualSenderEmail, requested: limit, sent: 0, failed: 0, skipped: 0, results: [], note: 'No unsent ready emails in queue.' });
+
+    const leads = readJsonFile(DORK_LEADS_FILE, []);
+    const results = [];
+    let sent = 0, failed = 0, skipped = 0;
+    const now = new Date().toISOString();
+
+    for (let i = 0; i < ready.length; i++) {
+      const lead = ready[i];
+      const row = emailScoutRow(lead);
+      if (!row.email || !row.subject || !row.message) {
+        skipped++;
+        results.push({ id: row.id, email: row.email, status: 'skipped', reason: 'missing email, subject, or message' });
+        continue;
+      }
+      if (dryRun) {
+        skipped++;
+        results.push({ id: row.id, email: row.email, status: 'dry_run', subject: row.subject });
+        continue;
+      }
+      try {
+        const gmailResult = await sendGmailApiMessage(accessToken, lead, actualSenderEmail);
+        const patch = {
+          contactStatus: 'sent',
+          sentAt: new Date().toISOString(),
+          sentBy: actualSenderEmail,
+          sendBatchId: batchId,
+          sendProvider: 'gmail_api',
+          gmailMessageId: gmailResult.id || '',
+          gmailThreadId: gmailResult.threadId || '',
+          lastSendError: '',
+        };
+        markLeadSendResult(leads, row.id, row.email, patch);
+        sent++;
+        results.push({ id: row.id, email: row.email, status: 'sent', gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
+      } catch (e) {
+        failed++;
+        const errData = e.response?.data || {};
+        const reason = errData.error?.message || errData.error_description || e.message || String(e);
+        markLeadSendResult(leads, row.id, row.email, {
+          contactStatus: 'send_failed',
+          sendFailedAt: new Date().toISOString(),
+          sentBy: actualSenderEmail,
+          sendBatchId: batchId,
+          sendProvider: 'gmail_api',
+          lastSendError: reason,
+        });
+        results.push({ id: row.id, email: row.email, status: 'failed', reason });
+      }
+      if (delayMs && i < ready.length - 1) await sleep(delayMs);
+    }
+
+    if (!dryRun) writeJsonFile(DORK_LEADS_FILE, leads);
+    res.json({
+      success: true,
+      batchId,
+      senderEmail: actualSenderEmail,
+      requested: limit,
+      attempted: ready.length,
+      sent,
+      failed,
+      skipped,
+      dryRun,
+      startedAt: now,
+      finishedAt: new Date().toISOString(),
+      results,
+      note: dryRun ? 'Dry run only. No email was sent.' : 'Messages were sent through the connected Gmail account via Gmail API.'
+    });
+  } catch (e) {
+    const errData = e.response?.data || {};
+    res.status(400).json({ success: false, error: errData.error?.message || errData.error_description || e.message || String(e) });
+  }
+});
+
+app.post('/email-scout/send-automatic', (req, res) => {
+  res.status(400).json({
+    success: false,
+    error: 'Use /email-scout/send-batch instead.',
+    reason: 'Browser-click Gmail sending is not used. Scout sends through the connected Gmail OAuth account via Gmail API, with an explicit user-selected batch limit.',
+    allowedNextStep: 'POST /email-scout/send-batch with limit, senderEmail, and Gmail OAuth tokens.'
+  });
+});
+
+// Google Maps lead campaign routes
+app.post('/maps-campaigns/start', (req, res) => {
+  const campaign = normalizeMapsCampaignPayload(req.body || {});
+  if (!campaign.industry || !campaign.location) return res.status(400).json({ error: 'industry and location required' });
+  saveMapCampaign(campaign);
+  setTimeout(() => runGoogleMapsCampaign(campaign.id), 50);
+  res.json({ success: true, campaign });
+});
+
+app.get('/maps-campaigns', (req, res) => {
+  const campaigns = readMapCampaigns().sort((a,b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  res.json({ success: true, total: campaigns.length, running: Array.from(runningMapCampaigns.keys()), campaigns });
+});
+
+app.get('/maps-campaigns/:id', (req, res) => {
+  const campaign = getMapCampaign(req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'maps campaign not found' });
+  res.json({ success: true, campaign, isRunning: runningMapCampaigns.has(req.params.id), serverTime: new Date().toISOString() });
+});
+
+app.post('/maps-campaigns/:id/stop', (req, res) => {
+  const campaign = getMapCampaign(req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'maps campaign not found' });
+  campaign.stopRequested = true;
+  campaign.status = runningMapCampaigns.has(req.params.id) ? 'stopping' : 'stopped';
+  saveMapCampaign(campaign);
+  res.json({ success: true, campaign });
+});
+
+app.get('/maps-campaigns/:id/leads', (req, res) => {
+  let leads = readJsonFile(DORK_LEADS_FILE, []).filter(l => l.campaignId === req.params.id || (Array.isArray(l.campaignIds) && l.campaignIds.includes(req.params.id)) || l.source === 'google_maps');
+  const since = String(req.query.since || req.query.updatedSince || '');
+  if (since) leads = leads.filter(l => String(l.lastSeenAt || l.updatedAt || l.addedAt || '') > since);
+  leads = leads.sort((a,b) => String(b.lastSeenAt || b.updatedAt || b.addedAt || '').localeCompare(String(a.lastSeenAt || a.updatedAt || a.addedAt || '')));
+  res.json({ success: true, campaignId: req.params.id, total: leads.length, leads: leads.slice(0, Math.min(5000, parseInt(req.query.limit || 1000, 10))), serverTime: new Date().toISOString() });
+});
+
+
 // ── EMAIL FINDING ─────────────────────────────────────────────────────────────
 
 app.post('/find-email', async (req, res) => {
@@ -1548,5 +2680,5 @@ app.post('/gmail/refresh', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Scout Backend v3.5 Cloud Runner on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
+  console.log(`Scout Backend v4.3 Email Scout Gmail Batch Sender on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
 });
