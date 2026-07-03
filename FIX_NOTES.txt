@@ -1,10 +1,1 @@
-Scout Backend Server v3.6 CLOUD RUNNER FIX
-
-Fixes added after v3.5:
-- Decodes Bing /ck/a redirect URLs so the cloud runner can discover real destination websites.
-- Adds broader Bing result parsing for href and data-url attributes.
-- Adds campaign logs showing how many destination URLs each signal discovers.
-- Adds safer search retry behavior when a Bing results page is empty.
-- Keeps email dedupe by normalized email; same email is merged, not duplicated.
-
-If campaigns previously completed with 0 emails instantly, this is likely the fix.
+v3.8 Multi-engine cloud campaign runner. Adds Bing RSS/html debug plus optional Google CSE and SerpAPI search providers. Dedupe remains by normalized email.

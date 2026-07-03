@@ -18,6 +18,10 @@ const ABSTRACT_EMAIL_API_KEY = process.env.ABSTRACT_EMAIL_API_KEY || '';
 const HUNTER_API_KEY = process.env.HUNTER_API_KEY || '';
 const NEVERBOUNCE_API_KEY = process.env.NEVERBOUNCE_API_KEY || '';
 const KICKBOX_API_KEY = process.env.KICKBOX_API_KEY || '';
+const SEARCH_PROVIDER = String(process.env.SEARCH_PROVIDER || 'auto').toLowerCase();
+const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
+const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
+const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
 let contactedPlaceIds = {};
@@ -135,6 +139,27 @@ async function fetchPage(url, timeout = 7000) {
     });
     return typeof r.data === 'string' ? r.data : '';
   } catch { return ''; }
+}
+
+
+async function fetchPageDetailed(url, timeout = 15000) {
+  try {
+    const r = await axios.get(url, {
+      timeout,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+      },
+      maxRedirects: 5,
+      validateStatus: s => s < 500,
+    });
+    const text = typeof r.data === 'string' ? r.data : JSON.stringify(r.data || '');
+    return { ok: r.status < 400, status: r.status, url, text, length: text.length, error: '' };
+  } catch (e) {
+    return { ok: false, status: e.response?.status || 0, url, text: '', length: 0, error: e.message || String(e) };
+  }
 }
 
 // Smart page priority — contact pages first, homepage, then others
@@ -618,6 +643,15 @@ function isBlockedOrConsentPage(html) {
   return text.includes('captcha') || text.includes('unusual traffic') || text.includes('verify you are human') || text.includes('consent');
 }
 
+function filterSearchCandidateUrls(values) {
+  return Array.from(values || [])
+    .map(u => normalizeUrl(u))
+    .filter(u => /^https?:\/\//i.test(u))
+    .filter(u => !/(^https?:\/\/([^\/]+\.)?(bing|microsoft|msn|live)\.)/i.test(u))
+    .filter(u => !/\/search\?|\/images\/|\/videos\/|\/maps\?|\/translator\?|\/account\//i.test(u))
+    .filter(u => !/\.(jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?|pdf)(\?|$)/i.test(u));
+}
+
 function extractBingUrls(html) {
   const urls = new Set();
   let m;
@@ -633,13 +667,24 @@ function extractBingUrls(html) {
   const dataUrlRegex = /data-(?:url|href)=["']([^"']+)["']/gi;
   while ((m = dataUrlRegex.exec(html))) urls.add(decodePossiblyBingRedirect(m[1]));
 
-  return Array.from(urls)
-    .map(u => normalizeUrl(u))
-    .filter(u => /^https?:\/\//i.test(u))
-    .filter(u => !/(^https?:\/\/([^\/]+\.)?(bing|microsoft|msn|live)\.)/i.test(u))
-    .filter(u => !/\/search\?|\/images\/|\/videos\/|\/maps\?/i.test(u))
-    .filter(u => !/\.(jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?|pdf)(\?|$)/i.test(u))
-    .slice(0, 100);
+  // Some Bing result payloads contain escaped URLs inside JSON blobs.
+  const jsonUrlRegex = /https?:\/\/[^"'<>\s]+/gi;
+  while ((m = jsonUrlRegex.exec(html))) urls.add(decodePossiblyBingRedirect(m[0].replace(/\\\//g, '/')));
+
+  return filterSearchCandidateUrls(urls).slice(0, 150);
+}
+
+function extractBingRssUrls(xml) {
+  const urls = new Set();
+  let m;
+  const itemRegex = /<item[\s\S]*?<link>([\s\S]*?)<\/link>[\s\S]*?<\/item>/gi;
+  while ((m = itemRegex.exec(xml))) urls.add(decodePossiblyBingRedirect(htmlDecode(m[1]).trim()));
+
+  // Backup: any link that appears after an item title.
+  const linkRegex = /<link>(https?:[^<]+)<\/link>/gi;
+  while ((m = linkRegex.exec(xml))) urls.add(decodePossiblyBingRedirect(htmlDecode(m[1]).trim()));
+
+  return filterSearchCandidateUrls(urls).slice(0, 150);
 }
 
 async function searchBingUrls(query, limit = 30) {
@@ -647,18 +692,35 @@ async function searchBingUrls(query, limit = 30) {
   const seen = new Set();
   const safeLimit = Math.max(1, Math.min(100, parseInt(limit || 30, 10)));
   let emptyPages = 0;
+
+  function addFound(found) {
+    for (const u of found) {
+      const key = normalizeUrl(u).replace(/\/$/, '').toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      urls.push(u);
+      if (urls.length >= safeLimit) break;
+    }
+  }
+
+  // RSS is often easier for server-side runners than parsing Bing's dynamic HTML.
+  for (let first = 1; urls.length < safeLimit && first <= 91; first += 10) {
+    const rssUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=${first}&mkt=en-US&setlang=en-US&ensearch=1&format=rss`;
+    const rss = await fetchPage(rssUrl, 15000);
+    const found = extractBingRssUrls(rss);
+    addFound(found);
+    if (!found.length) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // HTML fallback / supplement.
   for (let first = 1; urls.length < safeLimit && first <= 91; first += 10) {
     const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=${first}&mkt=en-US&setlang=en-US&ensearch=1`;
     const html = await fetchPage(searchUrl, 15000);
     const found = extractBingUrls(html);
-    for (const u of found) {
-      const key = normalizeUrl(u).replace(/\/$/, '');
-      if (!seen.has(key)) { seen.add(key); urls.push(u); }
-      if (urls.length >= safeLimit) break;
-    }
+    addFound(found);
     if (!found.length) {
       emptyPages++;
-      // Do not quit after one empty page; Bing can have a blocked/empty page or only ads.
       if (emptyPages >= 2 || isBlockedOrConsentPage(html)) break;
     } else {
       emptyPages = 0;
@@ -667,6 +729,162 @@ async function searchBingUrls(query, limit = 30) {
   }
   return urls.slice(0, safeLimit);
 }
+
+async function debugSearchBing(query, limit = 10) {
+  const safeLimit = Math.max(1, Math.min(50, parseInt(limit || 10, 10)));
+  const htmlUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=1&mkt=en-US&setlang=en-US&ensearch=1`;
+  const rssUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&first=1&mkt=en-US&setlang=en-US&ensearch=1&format=rss`;
+  const [htmlRes, rssRes] = await Promise.all([fetchPageDetailed(htmlUrl, 15000), fetchPageDetailed(rssUrl, 15000)]);
+  const htmlUrls = extractBingUrls(htmlRes.text || '');
+  const rssUrls = extractBingRssUrls(rssRes.text || '');
+  const combined = [];
+  const seen = new Set();
+  [...rssUrls, ...htmlUrls].forEach(u => {
+    const k = normalizeUrl(u).replace(/\/$/, '').toLowerCase();
+    if (!seen.has(k)) { seen.add(k); combined.push(u); }
+  });
+  return {
+    query,
+    htmlStatus: htmlRes.status,
+    htmlLength: htmlRes.length,
+    htmlBlocked: isBlockedOrConsentPage(htmlRes.text || ''),
+    htmlError: htmlRes.error,
+    rssStatus: rssRes.status,
+    rssLength: rssRes.length,
+    rssBlocked: isBlockedOrConsentPage(rssRes.text || ''),
+    rssError: rssRes.error,
+    htmlUrlsFound: htmlUrls.length,
+    rssUrlsFound: rssUrls.length,
+    combinedUrlsFound: combined.length,
+    sampleUrls: combined.slice(0, safeLimit),
+    searchHtmlEmails: cleanEmails(extractEmails(htmlRes.text || '')).slice(0, 10),
+    rssEmails: cleanEmails(extractEmails(rssRes.text || '')).slice(0, 10),
+  };
+}
+
+function organicUrlsFromSerpApiPayload(payload) {
+  const urls = new Set();
+  const organic = Array.isArray(payload?.organic_results) ? payload.organic_results : [];
+  for (const item of organic) {
+    if (item && item.link) urls.add(String(item.link));
+    if (item && item.redirect_link) urls.add(String(item.redirect_link));
+  }
+  return filterSearchCandidateUrls(urls);
+}
+
+function organicUrlsFromGoogleCsePayload(payload) {
+  const urls = new Set();
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  for (const item of items) if (item && item.link) urls.add(String(item.link));
+  return filterSearchCandidateUrls(urls);
+}
+
+async function searchSerpApiUrls(query, limit = 30) {
+  if (!SERPAPI_API_KEY) return [];
+  const urls = [];
+  const seen = new Set();
+  const safeLimit = Math.max(1, Math.min(100, parseInt(limit || 30, 10)));
+  for (let start = 0; urls.length < safeLimit && start <= 90; start += 10) {
+    const apiUrl = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(query)}&num=10&start=${start}&api_key=${encodeURIComponent(SERPAPI_API_KEY)}`;
+    const detail = await fetchPageDetailed(apiUrl, 20000);
+    if (!detail.ok || !detail.text) break;
+    let payload = {};
+    try { payload = JSON.parse(detail.text); } catch { break; }
+    const found = organicUrlsFromSerpApiPayload(payload);
+    if (!found.length) break;
+    for (const u of found) {
+      const key = normalizeUrl(u).replace(/\/$/, '').toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      urls.push(u);
+      if (urls.length >= safeLimit) break;
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return urls.slice(0, safeLimit);
+}
+
+async function searchGoogleCseUrls(query, limit = 30) {
+  if (!GOOGLE_CSE_API_KEY || !GOOGLE_CSE_CX) return [];
+  const urls = [];
+  const seen = new Set();
+  const safeLimit = Math.max(1, Math.min(100, parseInt(limit || 30, 10)));
+  for (let start = 1; urls.length < safeLimit && start <= 91; start += 10) {
+    const apiUrl = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(GOOGLE_CSE_API_KEY)}&cx=${encodeURIComponent(GOOGLE_CSE_CX)}&q=${encodeURIComponent(query)}&num=10&start=${start}`;
+    const detail = await fetchPageDetailed(apiUrl, 20000);
+    if (!detail.ok || !detail.text) break;
+    let payload = {};
+    try { payload = JSON.parse(detail.text); } catch { break; }
+    const found = organicUrlsFromGoogleCsePayload(payload);
+    if (!found.length) break;
+    for (const u of found) {
+      const key = normalizeUrl(u).replace(/\/$/, '').toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      urls.push(u);
+      if (urls.length >= safeLimit) break;
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return urls.slice(0, safeLimit);
+}
+
+function resolveSearchProvider(engine) {
+  const requested = String(engine || SEARCH_PROVIDER || 'auto').toLowerCase().replace(/-/g, '_');
+  if (['google', 'google_cse', 'cse'].includes(requested)) return 'google_cse';
+  if (['serpapi', 'google_serpapi'].includes(requested)) return 'serpapi';
+  if (['bing', 'bing_rss'].includes(requested)) return 'bing';
+  return 'auto';
+}
+
+async function searchUrlsWithProvider(query, limit = 30, engine = 'auto') {
+  const provider = resolveSearchProvider(engine);
+  const tried = [];
+  async function run(providerName) {
+    if (providerName === 'google_cse') {
+      if (!GOOGLE_CSE_API_KEY || !GOOGLE_CSE_CX) return { urls: [], provider: 'google_cse', skipped: 'missing GOOGLE_CSE_API_KEY or GOOGLE_CSE_CX' };
+      return { urls: await searchGoogleCseUrls(query, limit), provider: 'google_cse' };
+    }
+    if (providerName === 'serpapi') {
+      if (!SERPAPI_API_KEY) return { urls: [], provider: 'serpapi', skipped: 'missing SERPAPI_API_KEY' };
+      return { urls: await searchSerpApiUrls(query, limit), provider: 'serpapi' };
+    }
+    return { urls: await searchBingUrls(query, limit), provider: 'bing' };
+  }
+
+  if (provider !== 'auto') {
+    const result = await run(provider);
+    tried.push({ provider: result.provider, found: result.urls.length, skipped: result.skipped || '' });
+    return { urls: result.urls, provider: result.provider, tried };
+  }
+
+  // Auto mode: Bing first because it has an RSS endpoint; then Google CSE/SerpAPI only if keys exist.
+  for (const providerName of ['bing', 'google_cse', 'serpapi']) {
+    const result = await run(providerName);
+    tried.push({ provider: result.provider, found: result.urls.length, skipped: result.skipped || '' });
+    if (result.urls.length) return { urls: result.urls, provider: result.provider, tried };
+  }
+  return { urls: [], provider: 'none', tried };
+}
+
+async function debugSearchAny(query, limit = 10, engine = 'auto') {
+  const bingDebug = await debugSearchBing(query, limit);
+  const cseUrls = GOOGLE_CSE_API_KEY && GOOGLE_CSE_CX ? await searchGoogleCseUrls(query, limit) : [];
+  const serpUrls = SERPAPI_API_KEY ? await searchSerpApiUrls(query, limit) : [];
+  const selected = await searchUrlsWithProvider(query, limit, engine);
+  return {
+    query,
+    requestedProvider: resolveSearchProvider(engine),
+    selectedProvider: selected.provider,
+    tried: selected.tried,
+    bing: bingDebug,
+    googleCse: { enabled: !!(GOOGLE_CSE_API_KEY && GOOGLE_CSE_CX), urlsFound: cseUrls.length, sampleUrls: cseUrls.slice(0, limit) },
+    serpApi: { enabled: !!SERPAPI_API_KEY, urlsFound: serpUrls.length, sampleUrls: serpUrls.slice(0, limit) },
+    combinedUrlsFound: selected.urls.length,
+    sampleUrls: selected.urls.slice(0, limit),
+  };
+}
+
 
 function createCampaignPayload(body = {}) {
   const settings = normalizeDorkSettings(body.settings || body || {});
@@ -729,13 +947,21 @@ async function runCloudCampaign(campaignId) {
       logCampaign(campaign, `Searching signal ${sIndex + 1}/${campaign.signals.length}: ${query}`);
 
       let urls = [];
-      try { urls = await searchBingUrls(query, campaign.resultsPerSignal); }
-      catch(e) { campaign.errors++; logCampaign(campaign, 'Bing search failed: ' + e.message); }
+      let searchProvider = 'none';
+      try {
+        const searchResult = await searchUrlsWithProvider(query, campaign.resultsPerSignal, campaign.engine || SEARCH_PROVIDER || 'auto');
+        urls = searchResult.urls || [];
+        searchProvider = searchResult.provider || 'none';
+        campaign.lastSearchProvider = searchProvider;
+        campaign.lastSearchTried = searchResult.tried || [];
+        logCampaign(campaign, `Search providers tried: ${(searchResult.tried || []).map(t => `${t.provider}:${t.found}${t.skipped ? ' skipped=' + t.skipped : ''}`).join(', ')}`);
+      }
+      catch(e) { campaign.errors++; logCampaign(campaign, 'Search failed: ' + e.message); }
       campaign.totalUrlsDiscovered += urls.length;
       saveCampaign(campaign);
-      logCampaign(campaign, `Discovered ${urls.length} destination URLs for this signal.`);
+      logCampaign(campaign, `Discovered ${urls.length} destination URLs for this signal using ${searchProvider}.`);
       if (!urls.length) {
-        logCampaign(campaign, 'No destination URLs found. The signal may be weak, or Bing may have blocked/changed the search page.');
+        logCampaign(campaign, 'No destination URLs found. Check /debug-search. If Bing returns 0, set SEARCH_PROVIDER=google_cse with GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX, or SEARCH_PROVIDER=serpapi with SERPAPI_API_KEY.');
       }
 
       for (const url of urls) {
@@ -769,7 +995,7 @@ async function runCloudCampaign(campaignId) {
               sourceUrl: url,
               campaignId: campaign.id,
               source: 'cloud_campaign',
-              sourceEngine: 'bing',
+              sourceEngine: searchProvider,
             }));
 
             if (campaign.verifyWhileRunning) {
@@ -818,12 +1044,13 @@ async function runCloudCampaign(campaignId) {
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v3.6 Cloud Runner Bing Redirect Fix', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v3.8 Multi-Engine Cloud Runner', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
   emailVerifier: {
     provider: EMAIL_VERIFIER_PROVIDER || 'basic_mx',
     hasProviderKey: !!getVerifierProviderKey(EMAIL_VERIFIER_PROVIDER),
   },
+  searchProvider: { default: SEARCH_PROVIDER || 'auto', hasSerpApiKey: !!SERPAPI_API_KEY, hasGoogleCseKey: !!GOOGLE_CSE_API_KEY, hasGoogleCseCx: !!GOOGLE_CSE_CX },
   stats: { totalContacted: Object.keys(contactedPlaceIds).length, dailySummaries: dailySummaries.length }
 }));
 
@@ -887,6 +1114,34 @@ app.get('/dork-leads', (req, res) => {
 
 
 // ── CLOUD CAMPAIGN ROUTES ───────────────────────────────────────────────────
+
+
+app.get('/debug-search', async (req, res) => {
+  try {
+    const savedSettings = readJsonFile(DORK_SETTINGS_FILE, normalizeDorkSettings({}));
+    const rawSignal = req.query.signal || savedSettings.signals?.[0] || '';
+    const query = String(req.query.q || req.query.query || (rawSignal ? buildSearchQuery(rawSignal, savedSettings) : '')).trim();
+    if (!query) return res.status(400).json({ error: 'query required. Pass ?q=... or save dork settings first.' });
+    const debug = await debugSearchAny(query, req.query.limit || 10, req.query.engine || req.query.provider || SEARCH_PROVIDER || 'auto');
+    res.json({ success: true, service: 'Scout Backend v3.8', debug });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+app.post('/debug-extract', async (req, res) => {
+  try {
+    const url = String(req.body?.url || req.query.url || '').trim();
+    if (!url) return res.status(400).json({ error: 'url required' });
+    const html = await fetchPage(url, 15000);
+    const direct = cleanEmails(extractEmails(html));
+    let crawl = { emails: [], phones: [], reached: 0 };
+    if (!direct.length) crawl = await crawlSiteForEmail(url);
+    res.json({ success: true, url, htmlLength: html.length, directEmails: direct, crawl, title: extractTitle(html, rootDomain(url)) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
 
 app.post('/campaigns/start', (req, res) => {
   const campaign = createCampaignPayload(req.body || {});

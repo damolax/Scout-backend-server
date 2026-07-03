@@ -1,7 +1,7 @@
 {
   "name": "scout-email-finder",
-  "version": "3.5.0",
-  "description": "Scout backend with cloud dork campaign runner, dedupe, email verification, and lead sync",
+  "version": "3.7.0",
+  "description": "Scout backend with cloud dork campaign runner, Bing RSS fallback, debug search, dedupe, email verification, and lead sync",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
