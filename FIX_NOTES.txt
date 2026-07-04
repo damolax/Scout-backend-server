@@ -1,17 +1,1 @@
-Scout Backend v4.3 Email Scout Gmail Batch Sender
-
-Adds Gmail API sending from the Email Scout ready queue with explicit batch limits.
-
-New endpoint:
-- POST /email-scout/send-batch
-
-What it does:
-- Uses connected Gmail OAuth access token or refresh token + client_id.
-- Sends only unsent leads already in Email Scout ready queue.
-- Respects user-selected limit, e.g. 200 out of 1000 queued emails.
-- Sends sequentially with delayMs to reduce risk.
-- Marks sent leads with sentAt, sentBy, Gmail message id, and batch id.
-- Excludes sent leads from /email-scout/ready by default.
-
-Important:
-This does not browser-click Gmail. It sends through Gmail API using the connected Gmail account.
+v4.6: Fix Gmail identity resolution, prevent unknown@gmail.com, add /gmail/profile and diagnostic aliases /gmail/status /gmail/diagnostics /gmail/test.

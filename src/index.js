@@ -1100,7 +1100,7 @@ async function runCloudCampaign(campaignId) {
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v4.3 Email Scout Gmail Batch Sender', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v4.5 Gmail Connection Diagnostics', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
   browserGoogleMapsImport: { enabled: true, requiresGoogleApiKey: false, endpoint: '/leads/import-google-maps-browser' },
   emailVerifier: {
@@ -2410,6 +2410,96 @@ app.post('/email-scout/send-automatic', (req, res) => {
   });
 });
 
+
+
+// Send an explicit selected batch from the Scout App local queue through Gmail API.
+// This is used when Scout App stores leads in IndexedDB/local browser storage and the backend
+// should send exactly the contacts the user selected, not whatever happens to be in server files.
+app.post('/email-scout/send-selected-batch', async (req, res) => {
+  const body = req.body || {};
+  const rawContacts = Array.isArray(body.contacts) ? body.contacts : [];
+  const limit = normalizeSendBatchLimit(body.limit || rawContacts.length || 50);
+  const delayMs = Math.max(0, Math.min(60000, parseInt(body.delayMs || 1500, 10) || 0));
+  const dryRun = !!body.dryRun;
+  const senderEmailInput = String(body.senderEmail || body.fromEmail || '').trim();
+  const batchId = 'gmail_selected_batch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  let accessToken = body.access_token || body.accessToken || '';
+  const refreshToken = body.refresh_token || body.refreshToken || '';
+  const clientId = body.client_id || body.clientId || process.env.GOOGLE_CLIENT_ID || '';
+  const expiresAt = Number(body.expires_at || body.expiresAt || 0);
+  const nowMs = Date.now();
+
+  if (!rawContacts.length) {
+    return res.status(400).json({ success: false, error: 'No contacts supplied. Send contacts: [{ email, subject, message }].' });
+  }
+  if (!accessToken && !refreshToken) {
+    return res.status(400).json({ success: false, error: 'Missing Gmail OAuth token. Connect Gmail in Scout App Settings first.' });
+  }
+
+  try {
+    if (refreshToken && (!accessToken || (expiresAt && expiresAt < nowMs + 60000) || body.forceRefresh)) {
+      accessToken = await refreshGmailAccessTokenForSend({ refresh_token: refreshToken, client_id: clientId });
+    }
+    const profile = accessToken ? await getGmailProfile(accessToken) : {};
+    const actualSenderEmail = profile.emailAddress || senderEmailInput || 'connected-gmail-account';
+    const contacts = rawContacts.slice(0, limit).map((c, i) => ({
+      id: c.id || c.leadId || c.businessId || ('contact_' + i),
+      name: c.name || c.businessName || c.company || '',
+      email: normalizeEmail(c.email || c.best_email || ''),
+      subject: String(c.subject || c.messageSubject || '').trim(),
+      message: String(c.message || c.body || c.messageBody || '').trim()
+    }));
+
+    const results = [];
+    let sent = 0, failed = 0, skipped = 0;
+    const startedAt = new Date().toISOString();
+
+    for (let i = 0; i < contacts.length; i++) {
+      const row = contacts[i];
+      if (!row.email || !isLikelyEmail(row.email) || !row.subject || !row.message) {
+        skipped++;
+        results.push({ id: row.id, email: row.email, status: 'skipped', reason: 'missing or invalid email, subject, or message' });
+        continue;
+      }
+      if (dryRun) {
+        skipped++;
+        results.push({ id: row.id, email: row.email, name: row.name, status: 'dry_run', subject: row.subject });
+        continue;
+      }
+      try {
+        const gmailResult = await sendGmailApiMessage(accessToken, row, actualSenderEmail);
+        sent++;
+        results.push({ id: row.id, email: row.email, name: row.name, status: 'sent', subject: row.subject, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
+      } catch (e) {
+        failed++;
+        const errData = e.response?.data || {};
+        const reason = errData.error?.message || errData.error_description || e.message || String(e);
+        results.push({ id: row.id, email: row.email, name: row.name, status: 'failed', subject: row.subject, reason });
+      }
+      if (delayMs && i < contacts.length - 1) await sleep(delayMs);
+    }
+
+    res.json({
+      success: true,
+      batchId,
+      senderEmail: actualSenderEmail,
+      requested: limit,
+      attempted: contacts.length,
+      sent,
+      failed,
+      skipped,
+      dryRun,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      results,
+      note: dryRun ? 'Dry run only. No email was sent.' : 'Messages were sent through the connected Gmail account via Gmail API.'
+    });
+  } catch (e) {
+    const errData = e.response?.data || {};
+    res.status(400).json({ success: false, error: errData.error?.message || errData.error_description || e.message || String(e) });
+  }
+});
+
 // Google Maps lead campaign routes
 app.post('/maps-campaigns/start', (req, res) => {
   const campaign = normalizeMapsCampaignPayload(req.body || {});
@@ -2630,22 +2720,43 @@ app.post('/gmail/exchange', async (req, res) => {
 
     const tokens = tokenRes.data;
 
-    // Get the user's email
-    let email = 'unknown@gmail.com';
+    // Get the user's real Gmail address. Gmail scopes do not always allow oauth2/userinfo,
+    // so use the Gmail profile endpoint first. This prevents the old unknown@gmail.com fallback.
+    let email = '';
+    let profileSource = '';
     if (tokens.access_token) {
       try {
-        const profileRes = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
-          headers: { 'Authorization': 'Bearer ' + tokens.access_token }
-        });
-        email = profileRes.data.email || email;
+        const gmailProfile = await getGmailProfile(tokens.access_token);
+        if (gmailProfile && gmailProfile.emailAddress) {
+          email = gmailProfile.emailAddress;
+          profileSource = 'gmail_profile';
+        }
       } catch {}
+      if (!email) {
+        try {
+          const profileRes = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+            headers: { 'Authorization': 'Bearer ' + tokens.access_token }
+          });
+          email = profileRes.data.email || '';
+          if (email) profileSource = 'oauth_userinfo';
+        } catch {}
+      }
+    }
+
+    if (!email) {
+      return res.status(400).json({
+        error: 'Gmail connected, but Scout could not read the Gmail address. Reconnect with gmail.send / gmail.readonly scopes and make sure Gmail API is enabled.',
+        code: 'gmail_email_profile_missing'
+      });
     }
 
     res.json({
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token,
       expires_in: tokens.expires_in || 3600,
+      scope: tokens.scope || '',
       email,
+      profile_source: profileSource,
     });
   } catch (err) {
     const errData = err.response?.data || {};
@@ -2679,6 +2790,65 @@ app.post('/gmail/refresh', async (req, res) => {
   }
 });
 
+
+
+function gmailDiagnosticPayload(req) {
+  return {
+    ok: true,
+    version: 'v4.6-gmail-identity-fix',
+    google_client_secret_set: Boolean(process.env.GOOGLE_CLIENT_SECRET),
+    google_client_id_set: Boolean(process.env.GOOGLE_CLIENT_ID),
+    gmail_client_secret_env_name: 'GOOGLE_CLIENT_SECRET',
+    endpoints: {
+      exchange: true,
+      refresh: true,
+      profile: true,
+      send_selected_batch: true,
+      status: true,
+    },
+    required_frontend_redirect_uri: req.query.redirect_uri || 'Use the exact Scout App URL shown in Settings',
+    notes: [
+      'If google_client_secret_set is false, add GOOGLE_CLIENT_SECRET in Render Environment and redeploy.',
+      'If this endpoint returns 404, your Render backend is still running an older build or your Backend URL points to the wrong service.',
+      'Google Cloud Authorized redirect URI must exactly match the Scout App redirect URI.',
+      'Reconnect Gmail after changing scopes.'
+    ],
+  };
+}
+
+// Gmail OAuth diagnostic status. Multiple aliases are provided so the frontend can test safely.
+app.get('/gmail/status', (req, res) => res.json(gmailDiagnosticPayload(req)));
+app.get('/gmail/diagnostics', (req, res) => res.json(gmailDiagnosticPayload(req)));
+app.get('/gmail/test', (req, res) => res.json(gmailDiagnosticPayload(req)));
+
+// Resolve the real connected Gmail email from saved tokens.
+app.post('/gmail/profile', async (req, res) => {
+  const body = req.body || {};
+  let accessToken = body.access_token || body.accessToken || '';
+  const refreshToken = body.refresh_token || body.refreshToken || '';
+  const clientId = body.client_id || body.clientId || process.env.GOOGLE_CLIENT_ID || '';
+  try {
+    let profile = accessToken ? await getGmailProfile(accessToken) : {};
+    if ((!profile || !profile.emailAddress) && refreshToken) {
+      accessToken = await refreshGmailAccessTokenForSend({ refresh_token: refreshToken, client_id: clientId });
+      profile = await getGmailProfile(accessToken);
+    }
+    if (!profile || !profile.emailAddress) {
+      return res.status(400).json({ success: false, error: 'Could not resolve Gmail profile email. Reconnect Gmail and confirm Gmail API is enabled.' });
+    }
+    res.json({
+      success: true,
+      email: profile.emailAddress,
+      messagesTotal: profile.messagesTotal,
+      threadsTotal: profile.threadsTotal,
+      access_token: accessToken || undefined,
+    });
+  } catch (e) {
+    const errData = e.response?.data || {};
+    res.status(400).json({ success: false, error: errData.error?.message || errData.error_description || e.message || String(e) });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`Scout Backend v4.3 Email Scout Gmail Batch Sender on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
+  console.log(`Scout Backend v4.6 Gmail Identity Fix on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
 });
