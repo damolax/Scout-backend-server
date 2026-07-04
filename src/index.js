@@ -23,7 +23,7 @@ const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
-app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.0.0-final-gmail-send', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.5.0-team-scouted-protection', time: new Date().toISOString() }));
 
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
@@ -36,6 +36,7 @@ const DORK_LEADS_FILE = path.join(DATA_DIR, 'dork-leads.json');
 const CAMPAIGNS_FILE = path.join(DATA_DIR, 'dork-campaigns.json');
 const MAP_CAMPAIGNS_FILE = path.join(DATA_DIR, 'maps-campaigns.json');
 const MESSAGE_TEMPLATES_FILE = path.join(DATA_DIR, 'message-templates.json');
+const TEAM_SCOUTED_FILE = path.join(DATA_DIR, 'team-scouted-registry.json');
 
 function ensureDataDir() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
@@ -52,6 +53,120 @@ function readJsonFile(file, fallback) {
 function writeJsonFile(file, data) {
   ensureDataDir();
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function normalizeTeamEmail(v) {
+  return String(v || '').trim().toLowerCase().replace(/^mailto:/, '').replace(/[;,.)\]]+$/g, '').replace(/^[<([\s]+/g, '');
+}
+
+function normalizeTeamDomain(v) {
+  let raw = String(v || '').trim().toLowerCase();
+  if (!raw) return '';
+  raw = raw.replace(/^mailto:/, '');
+  try { raw = new URL(/^https?:\/\//i.test(raw) ? raw : 'https://' + raw).hostname; } catch {}
+  return raw.replace(/^www\./, '').split('/')[0].split('?')[0].split('#')[0].split(':')[0].replace(/[;,.)\]]+$/g, '');
+}
+
+function normalizeTeamLink(v) {
+  let raw = String(v || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    u.hash = '';
+    return u.toString().replace(/\/+$/, '').toLowerCase();
+  } catch {
+    return raw.toLowerCase().replace(/\/+$/, '');
+  }
+}
+
+function normalizeTeamName(v) {
+  return String(v || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+function blankTeamRegistry() {
+  return { byEmail: {}, byPlaceId: {}, byDomain: {}, byProfileLink: {}, byNameDomain: {}, records: [] };
+}
+
+function loadTeamRegistry() {
+  const r = readJsonFile(TEAM_SCOUTED_FILE, blankTeamRegistry());
+  return { ...blankTeamRegistry(), ...(r || {}) };
+}
+
+function saveTeamRegistry(registry) {
+  const r = { ...blankTeamRegistry(), ...(registry || {}) };
+  // Keep a practical cap for free Render disks while preserving indexes.
+  if (Array.isArray(r.records) && r.records.length > 50000) r.records = r.records.slice(-50000);
+  writeJsonFile(TEAM_SCOUTED_FILE, r);
+}
+
+function teamLeadIdentifiers(lead = {}) {
+  const email = normalizeTeamEmail(lead.email || lead.best_email || lead.validatedEmail || lead.validatedEmail1 || (Array.isArray(lead.emails) ? lead.emails[0] : ''));
+  const placeId = String(lead.place_id || lead.placeId || lead.placeID || lead.googlePlaceId || '').trim();
+  const profileLink = normalizeTeamLink(lead.profileLink || lead.profile_link || lead.maps_url || lead.mapsUrl || lead.googleMapsUrl || lead.url || '');
+  const website = lead.website || lead.site || lead.domain || lead.url || lead.businessWebsite || '';
+  const domain = normalizeTeamDomain(lead.domain || website || (email.includes('@') ? email.split('@')[1] : ''));
+  const name = normalizeTeamName(lead.name || lead.businessName || lead.business || lead.company || lead.title || '');
+  const nameDomain = name && domain ? `${name}|${domain}` : '';
+  return { email, placeId, profileLink, domain, name, nameDomain };
+}
+
+function teamRecordFromLead(lead = {}, meta = {}) {
+  const ids = teamLeadIdentifiers(lead);
+  return {
+    id: String(lead.id || lead.businessId || lead.leadId || ids.email || ids.placeId || ids.profileLink || ids.nameDomain || ('team_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8))),
+    name: lead.name || lead.businessName || lead.business || lead.company || '',
+    email: ids.email,
+    place_id: ids.placeId,
+    profileLink: ids.profileLink,
+    domain: ids.domain,
+    nameDomain: ids.nameDomain,
+    website: lead.website || lead.site || lead.domain || '',
+    source: lead.source || meta.source || 'scout_app',
+    status: lead.status || meta.status || 'contacted',
+    actor: meta.actor || lead.actor || lead.sentBy || lead.gmailUsed || lead.senderEmail || '',
+    senderEmail: meta.senderEmail || lead.senderEmail || lead.sentBy || lead.gmailUsed || '',
+    batchId: meta.batchId || lead.batchId || lead.sendBatchId || '',
+    sentAt: lead.sentAt || lead.contactedAt || meta.sentAt || new Date().toISOString(),
+    markedAt: new Date().toISOString(),
+  };
+}
+
+function findTeamScoutMatch(lead, registry = loadTeamRegistry()) {
+  const ids = teamLeadIdentifiers(lead);
+  const checks = [
+    ['email', ids.email, registry.byEmail],
+    ['place_id', ids.placeId, registry.byPlaceId],
+    ['profile_link', ids.profileLink, registry.byProfileLink],
+    ['domain', ids.domain, registry.byDomain],
+    ['name_domain', ids.nameDomain, registry.byNameDomain],
+  ];
+  for (const [kind, key, index] of checks) {
+    if (key && index && index[key]) {
+      return { blocked: true, matchedBy: kind, key, record: index[key] };
+    }
+  }
+  return { blocked: false, matchedBy: '', key: '', record: null };
+}
+
+function markTeamScouted(leads, meta = {}) {
+  const registry = loadTeamRegistry();
+  const list = Array.isArray(leads) ? leads : [leads];
+  let marked = 0;
+  const markedRecords = [];
+  for (const lead of list) {
+    const rec = teamRecordFromLead(lead, meta);
+    if (!rec.email && !rec.place_id && !rec.profileLink && !rec.domain && !rec.nameDomain) continue;
+    if (rec.email) registry.byEmail[rec.email] = rec;
+    if (rec.place_id) registry.byPlaceId[rec.place_id] = rec;
+    if (rec.profileLink) registry.byProfileLink[rec.profileLink] = rec;
+    if (rec.domain && !['gmail.com','yahoo.com','outlook.com','hotmail.com','live.com','icloud.com','aol.com','proton.me','protonmail.com'].includes(rec.domain)) registry.byDomain[rec.domain] = rec;
+    if (rec.nameDomain) registry.byNameDomain[rec.nameDomain] = rec;
+    registry.records.push(rec);
+    marked++;
+    markedRecords.push(rec);
+  }
+  saveTeamRegistry(registry);
+  return { marked, records: markedRecords, total: registry.records.length };
 }
 
 function normalizeDorkSettings(input = {}) {
@@ -133,6 +248,68 @@ function extractPhones(html) {
   return s;
 }
 
+
+function decodeCloudflareEmail(hex) {
+  try {
+    const clean = String(hex || '').replace(/[^a-f0-9]/gi, '');
+    if (clean.length < 4) return '';
+    const key = parseInt(clean.slice(0, 2), 16);
+    let out = '';
+    for (let i = 2; i < clean.length; i += 2) out += String.fromCharCode(parseInt(clean.slice(i, i + 2), 16) ^ key);
+    return /@/.test(out) ? out : '';
+  } catch { return ''; }
+}
+
+function extractEmailsEnhanced(html) {
+  const s = extractEmails(String(html || ''));
+  const body = String(html || '');
+  (body.match(/data-cfemail=["']([a-f0-9]+)["']/gi) || []).forEach(m => {
+    const mm = m.match(/data-cfemail=["']([a-f0-9]+)["']/i);
+    const decoded = mm ? decodeCloudflareEmail(mm[1]) : '';
+    if (decoded) s.add(decoded);
+  });
+  (body.match(/href=["'][^"']*\/cdn-cgi\/l\/email-protection#[a-f0-9]+["']/gi) || []).forEach(m => {
+    const mm = m.match(/#([a-f0-9]+)/i);
+    const decoded = mm ? decodeCloudflareEmail(mm[1]) : '';
+    if (decoded) s.add(decoded);
+  });
+  // common encoded forms: name (at) domain (dot) com, name [@] domain [. ] com
+  (body.match(/[a-z0-9._%+\-]+\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*[a-z0-9.\-]+\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*[a-z]{2,}/gi) || []).forEach(m => {
+    const e = m.toLowerCase().replace(/\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*/gi, '@').replace(/\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*/gi, '.').replace(/\s+/g, '');
+    if (/@/.test(e)) s.add(e);
+  });
+  return s;
+}
+
+function normalizeWebsiteInput(websiteUrl) {
+  let raw = String(websiteUrl || '').trim();
+  if (!raw) return [];
+  raw = raw.replace(/^mailto:/i, '').replace(/^[\s,;]+|[\s,;]+$/g, '');
+  if (/^https?:\/\//i.test(raw)) return [raw];
+  return ['https://' + raw, 'http://' + raw];
+}
+
+async function resolveOrigin(websiteUrl) {
+  const candidates = normalizeWebsiteInput(websiteUrl);
+  for (const c of candidates) {
+    try {
+      const u = new URL(c);
+      const origin = u.origin;
+      const probe = await fetchPageDetailed(origin + '/', 10000);
+      if (probe.ok || probe.status === 403 || probe.status === 401) return { origin, firstPage: probe };
+    } catch {}
+  }
+  try { const u = new URL(candidates[0] || ''); return { origin: u.origin, firstPage: null }; } catch {}
+  return { origin: '', firstPage: null };
+}
+
+const AUTOSCOUT_EMAIL_PATHS = Array.from(new Set([
+  '', '/', '/contact', '/contact-us', '/contactus', '/contacts', '/contact.html', '/contact-us.html',
+  '/kontakt', '/kontakt.html', '/impressum', '/imprint', '/legal-notice', '/legal',
+  '/about', '/about-us', '/aboutus', '/pages/contact', '/pages/contact-us', '/pages/about-us',
+  '/get-in-touch', '/reach-us', '/support', '/help', '/info', '/team', '/customer-service', '/service'
+]));
+
 // ── FAST PARALLEL PAGE FETCHER ────────────────────────────────────────────────
 
 async function fetchPage(url, timeout = 7000) {
@@ -183,52 +360,69 @@ const PAGE_PRIORITY = [
 ];
 
 async function crawlSiteForEmail(websiteUrl) {
-  if (!websiteUrl) return { emails: [], phones: [], reached: 0 };
-
-  let origin;
-  try {
-    const u = new URL(websiteUrl.startsWith('http') ? websiteUrl : 'https://' + websiteUrl);
-    origin = u.origin;
-  } catch { return { emails: [], phones: [], reached: 0 }; }
+  if (!websiteUrl) return { emails: [], phones: [], reached: 0, debug: { reason: 'website required', pages: [] } };
+  const { origin, firstPage } = await resolveOrigin(websiteUrl);
+  if (!origin) return { emails: [], phones: [], reached: 0, debug: { reason: 'invalid or unreachable website URL', pages: [] } };
 
   const emails = new Set();
   const phones = new Set();
   let reached = 0;
-
-  // PHASE 1: Fetch contact page AND homepage simultaneously
-  const phase1 = ['/contact', '/contact-us', '', '/about'].map(p => origin + p);
-  const phase1Results = await Promise.allSettled(phase1.map(url => fetchPage(url)));
-
-  for (const result of phase1Results) {
-    if (result.status !== 'fulfilled' || !result.value) continue;
+  const homepageText = firstPage && firstPage.text ? firstPage.text : '';
+  if (homepageText) {
     reached++;
-    extractEmails(result.value).forEach(e => emails.add(e));
-    extractPhones(result.value).forEach(p => phones.add(p));
+    extractEmailsEnhanced(homepageText).forEach(e => emails.add(e));
+    extractPhones(homepageText).forEach(p => phones.add(p));
   }
 
-  // If we found emails in phase 1 — stop here (fast path)
-  const phase1Emails = cleanEmails(emails);
-  if (phase1Emails.length >= 1) {
-    return {
-      emails: phase1Emails.sort((a,b) => scoreEmail(b)-scoreEmail(a)).slice(0,5),
-      phones: Array.from(phones).slice(0,3),
-      reached,
-    };
-  }
-
-  // PHASE 2: Fetch 3 more pages simultaneously
-  const phase2 = ['/contactus', '/get-in-touch', '/info'].map(p => origin + p);
-  const phase2Results = await Promise.allSettled(phase2.map(url => fetchPage(url)));
-
-  for (const result of phase2Results) {
-    if (result.status !== 'fulfilled' || !result.value) continue;
+  // Contact-like pages, including German/ecommerce pages such as /kontakt and /impressum.
+  for (const path of AUTOSCOUT_EMAIL_PATHS) {
+    if (emails.size >= 1 && reached >= 2) break;
+    const url = origin + path;
+    if (firstPage && (path === '' || path === '/') && homepageText) continue;
+    const text = await fetchPage(url, 10000);
+    if (!text) continue;
     reached++;
-    extractEmails(result.value).forEach(e => emails.add(e));
-    extractPhones(result.value).forEach(p => phones.add(p));
+    extractEmailsEnhanced(text).forEach(e => emails.add(e));
+    extractPhones(text).forEach(p => phones.add(p));
   }
 
   const allEmails = cleanEmails(emails).sort((a,b) => scoreEmail(b)-scoreEmail(a));
-  return { emails: allEmails.slice(0,5), phones: Array.from(phones).slice(0,3), reached };
+  return { emails: allEmails.slice(0,5), phones: Array.from(phones).slice(0,3), reached, debug: { normalizedWebsite: origin, reason: allEmails.length ? 'emails found' : (reached ? 'pages reached but no visible email found' : 'no pages reached') } };
+}
+
+async function crawlSiteForEmailDebug(websiteUrl) {
+  if (!websiteUrl) return { emails: [], phones: [], reached: 0, debug: { reason: 'website required', pages: [] } };
+  const { origin, firstPage } = await resolveOrigin(websiteUrl);
+  if (!origin) return { emails: [], phones: [], reached: 0, debug: { reason: 'invalid or unreachable website URL', pages: [] } };
+  const emails = new Set();
+  const phones = new Set();
+  const pages = [];
+  let reached = 0;
+  for (const path of AUTOSCOUT_EMAIL_PATHS) {
+    const url = origin + path;
+    let r;
+    if (firstPage && (path === '' || path === '/')) r = firstPage;
+    else r = await fetchPageDetailed(url, 15000);
+    const foundEmails = cleanEmails(extractEmailsEnhanced(r.text || ''));
+    const foundPhones = Array.from(extractPhones(r.text || '')).slice(0, 5);
+    foundEmails.forEach(e => emails.add(e));
+    foundPhones.forEach(ph => phones.add(ph));
+    if (r.ok) reached++;
+    pages.push({ url, ok: !!r.ok, status: r.status || 0, length: r.length || 0, emailCount: foundEmails.length, phoneCount: foundPhones.length, error: r.error || '' });
+    if (emails.size >= 1 && pages.length >= 3) break;
+  }
+  const sortedEmails = cleanEmails(emails).sort((a,b) => scoreEmail(b) - scoreEmail(a)).slice(0,5);
+  return {
+    emails: sortedEmails,
+    phones: Array.from(phones).slice(0,3),
+    reached,
+    debug: {
+      normalizedWebsite: origin,
+      pathsChecked: AUTOSCOUT_EMAIL_PATHS.length,
+      pages,
+      reason: sortedEmails.length ? 'emails found' : (reached ? 'pages reached but no visible email found' : 'no pages reached')
+    }
+  };
 }
 
 // ── PLACE DETAILS ─────────────────────────────────────────────────────────────
@@ -1126,7 +1320,7 @@ async function runCloudCampaign(campaignId) {
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Scout Backend v4.5 Gmail Connection Diagnostics', timestamp: new Date().toISOString(),
+  status: 'ok', service: 'Scout Backend v5.4 Reply Tracking Fix', timestamp: new Date().toISOString(),
   hasGmapsKey: !!GMAPS_KEY,
   browserGoogleMapsImport: { enabled: true, requiresGoogleApiKey: false, endpoint: '/leads/import-google-maps-browser' },
   emailVerifier: {
@@ -2390,6 +2584,30 @@ function validateSendRow(row) {
   return '';
 }
 
+function normalizeSenderEmailForCompare(email) {
+  return normalizeEmail(email || '').toLowerCase();
+}
+
+function enforceSelectedGmailSender({ requestedSenderEmail, actualSenderEmail }) {
+  const requested = normalizeSenderEmailForCompare(requestedSenderEmail);
+  const actual = normalizeSenderEmailForCompare(actualSenderEmail);
+  if (!actual) {
+    const err = new Error('Scout could not confirm which Gmail account this token belongs to. Disconnect and reconnect Gmail, then try again.');
+    err.status = 400;
+    err.code = 'gmail_profile_missing';
+    throw err;
+  }
+  if (requested && actual !== requested) {
+    const err = new Error(`Selected Gmail account mismatch. You selected ${requested}, but the OAuth token belongs to ${actual}. Scout blocked the send so messages are not sent from the wrong Gmail account. Disconnect/reconnect the correct Gmail account or choose ${actual} in Send Message.`);
+    err.status = 409;
+    err.code = 'gmail_sender_mismatch';
+    err.requestedSenderEmail = requested;
+    err.actualSenderEmail = actual;
+    throw err;
+  }
+  return actual;
+}
+
 function markLeadSendResult(leads, leadId, email, patch) {
   const norm = normalizeEmail(email);
   let updated = 0;
@@ -2446,6 +2664,12 @@ app.post('/email-scout/send-batch', async (req, res) => {
         results.push({ id: row.id, email: row.email, status: 'skipped', reason: invalidReason });
         continue;
       }
+      const teamMatch = findTeamScoutMatch(row);
+      if (teamMatch.blocked) {
+        skipped++;
+        results.push({ id: row.id, email: row.email, status: 'skipped', reason: 'team_already_scouted', matchedBy: teamMatch.matchedBy });
+        continue;
+      }
       if (dryRun) {
         skipped++;
         results.push({ id: row.id, email: row.email, status: 'dry_run', subject: row.subject });
@@ -2465,6 +2689,7 @@ app.post('/email-scout/send-batch', async (req, res) => {
         };
         markLeadSendResult(leads, row.id, row.email, patch);
         sent++;
+        markTeamScouted([{ ...row, status: 'contacted', sentAt: new Date().toISOString(), senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
         results.push({ id: row.id, email: row.email, status: 'sent', gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
         failed++;
@@ -2488,6 +2713,8 @@ app.post('/email-scout/send-batch', async (req, res) => {
       success: true,
       batchId,
       senderEmail: actualSenderEmail,
+      selectedSenderEmail: normalizeSenderEmailForCompare(senderEmailInput),
+      senderVerifiedMatchesSelected: true,
       requested: limit,
       attempted: ready.length,
       sent,
@@ -2551,7 +2778,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
     accessToken = prof.accessToken || accessToken;
     tokenRefreshed = tokenRefreshed || !!prof.refreshed;
     const profile = prof.profile || {};
-    const actualSenderEmail = profile.emailAddress || senderEmailInput || 'connected-gmail-account';
+    const actualSenderEmail = enforceSelectedGmailSender({ requestedSenderEmail: senderEmailInput, actualSenderEmail: profile.emailAddress || '' });
 
     const contacts = rawContacts.slice(0, limit).map((c, i) => ({
       id: c.id || c.leadId || c.businessId || ('contact_' + i),
@@ -2560,6 +2787,12 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
       subject: String(c.subject || c.messageSubject || '').trim(),
       message: String(c.message || c.body || c.messageBody || '').trim(),
       templateName: c.templateName || c.messageTemplateName || '',
+      businessId: c.businessId || c.leadId || c.id || '',
+      place_id: c.place_id || c.placeId || c.googlePlaceId || '',
+      profileLink: c.profileLink || c.profile_link || c.maps_url || c.mapsUrl || '',
+      website: c.website || c.site || c.domain || '',
+      domain: c.domain || '',
+      source: c.source || 'send_selected_batch',
     }));
 
     const results = [];
@@ -2574,6 +2807,12 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
         results.push({ id: row.id, email: row.email, name: row.name, status: 'skipped', reason: invalidReason, subject: row.subject });
         continue;
       }
+      const teamMatch = findTeamScoutMatch(row);
+      if (teamMatch.blocked) {
+        skipped++;
+        results.push({ id: row.id, email: row.email, name: row.name, status: 'skipped', reason: 'team_already_scouted', matchedBy: teamMatch.matchedBy, subject: row.subject });
+        continue;
+      }
       if (dryRun) {
         skipped++;
         results.push({ id: row.id, email: row.email, name: row.name, status: 'dry_run', subject: row.subject });
@@ -2585,6 +2824,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
         tokenRefreshed = tokenRefreshed || !!sendResult.refreshed;
         const gmailResult = sendResult.data || {};
         sent++;
+        markTeamScouted([{ ...row, status: 'contacted', sentAt: new Date().toISOString(), senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
         results.push({ id: row.id, email: row.email, name: row.name, status: 'sent', subject: row.subject, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
         failed++;
@@ -2613,14 +2853,23 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
     });
   } catch (e) {
     const details = gmailApiErrorDetails(e);
-    res.status(400).json({ success: false, error: details.message, status: details.status, reason: details.reason });
+    const httpStatus = e.status || details.status || 400;
+    res.status(httpStatus).json({
+      success: false,
+      error: e.message || details.message,
+      status: httpStatus,
+      code: e.code || details.reason || '',
+      reason: details.reason || e.code || '',
+      requestedSenderEmail: e.requestedSenderEmail || normalizeSenderEmailForCompare(senderEmailInput),
+      actualSenderEmail: e.actualSenderEmail || ''
+    });
   }
 });
 
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.0.0-final-gmail-send',
+    version: '5.5.0-team-scouted-protection',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -2636,8 +2885,255 @@ app.get('/email-scout/send-diagnostics', (req, res) => {
       sleepDefined: typeof sleep === 'function',
       buildGmailRawMessageDefined: typeof buildGmailRawMessage === 'function',
       sendGmailApiMessageWithRetryDefined: typeof sendGmailApiMessageWithRetry === 'function',
+      enforceSelectedGmailSenderDefined: typeof enforceSelectedGmailSender === 'function',
     },
     serverTime: new Date().toISOString(),
+  });
+});
+
+
+
+// ── GMAIL REPLY TRACKING (v5.4) ──────────────────────────────────────────────
+// Browser polling was too narrow (unread + last 24h + exact sender). This backend
+// route checks sent thread IDs first, then falls back to a Gmail search by sender.
+function parseEmailFromHeader(headerValue) {
+  const raw = String(headerValue || '');
+  const m = raw.match(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i);
+  return m ? normalizeEmail(m[1]) : '';
+}
+
+function getHeader(headers, name) {
+  const wanted = String(name || '').toLowerCase();
+  const h = (headers || []).find(x => String(x.name || '').toLowerCase() === wanted);
+  return h ? String(h.value || '') : '';
+}
+
+function gmailBase64UrlDecode(data) {
+  if (!data) return '';
+  try {
+    let s = String(data).replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    return Buffer.from(s, 'base64').toString('utf8');
+  } catch { return ''; }
+}
+
+function stripHtml(html) {
+  return String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s+\n/g, '\n\n')
+    .trim();
+}
+
+function extractGmailTextBody(payload) {
+  function walk(part, preferHtml = false) {
+    if (!part) return '';
+    const mime = String(part.mimeType || '').toLowerCase();
+    const data = part.body && part.body.data;
+    if (data && mime === 'text/plain') return gmailBase64UrlDecode(data);
+    if (part.parts && Array.isArray(part.parts)) {
+      for (const child of part.parts) {
+        const txt = walk(child, preferHtml);
+        if (txt) return txt;
+      }
+    }
+    if (preferHtml && data && mime === 'text/html') return stripHtml(gmailBase64UrlDecode(data));
+    return '';
+  }
+  let txt = walk(payload, false);
+  if (!txt) txt = walk(payload, true);
+  txt = String(txt || '').replace(/\r/g, '').trim();
+  const lines = txt.split('\n');
+  const keep = [];
+  for (const line of lines) {
+    const l = line.trim();
+    if (/^>/.test(l)) break;
+    if (/^on .+ wrote:$/i.test(l)) break;
+    if (/^-{2,}\s*original message\s*-{2,}$/i.test(l)) break;
+    if (/^from:\s/i.test(l) && keep.length > 0) break;
+    keep.push(line);
+  }
+  return keep.join('\n').trim().slice(0, 2000);
+}
+
+function gmailDateQueryFromIso(iso, fallbackDays = 45) {
+  let d = iso ? new Date(iso) : null;
+  if (!d || Number.isNaN(d.getTime())) d = new Date(Date.now() - fallbackDays * 86400000);
+  d = new Date(d.getTime() - 24 * 60 * 60 * 1000); // small buffer before sent time
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}/${mm}/${dd}`;
+}
+
+async function gmailApiGet(accessToken, url) {
+  const r = await axios.get(url, { headers: { Authorization: 'Bearer ' + accessToken }, validateStatus: s => s < 500 });
+  if (r.status >= 400) {
+    const err = new Error(r.data?.error?.message || 'Gmail API request failed');
+    err.response = { status: r.status, data: r.data };
+    throw err;
+  }
+  return r.data || {};
+}
+
+function gmailMessageSummary(msg) {
+  const headers = msg.payload?.headers || [];
+  const fromHeader = getHeader(headers, 'From');
+  const replyToHeader = getHeader(headers, 'Reply-To');
+  const subject = getHeader(headers, 'Subject');
+  const dateHeader = getHeader(headers, 'Date');
+  const fromEmail = parseEmailFromHeader(fromHeader);
+  const replyToEmail = parseEmailFromHeader(replyToHeader);
+  const receivedAt = msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : (dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString());
+  return { id: msg.id, threadId: msg.threadId, fromHeader, replyToHeader, fromEmail, replyToEmail, subject, dateHeader, receivedAt, snippet: msg.snippet || '' };
+}
+
+function isLikelyReplyForContact(summary, contact, actualSenderEmail, fromThread) {
+  const prospect = normalizeEmail(contact.email || contact.best_email || '');
+  const actual = normalizeEmail(actualSenderEmail || '');
+  if (!prospect) return false;
+  if (summary.id && contact.gmailMessageId && String(summary.id) === String(contact.gmailMessageId)) return false;
+  if (actual && (summary.fromEmail === actual || summary.replyToEmail === actual)) return false;
+  const sentMs = new Date(contact.sentAt || contact.contactedAt || 0).getTime();
+  const msgMs = new Date(summary.receivedAt || 0).getTime();
+  if (sentMs && msgMs && msgMs < sentMs - 5 * 60 * 1000) return false;
+  if (summary.fromEmail === prospect || summary.replyToEmail === prospect) return true;
+  // If Gmail kept the reply inside the exact sent thread, accept any non-self sender.
+  if (fromThread && summary.fromEmail && summary.fromEmail !== actual) return true;
+  return false;
+}
+
+async function getFullGmailMessage(accessToken, id) {
+  return await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`);
+}
+
+async function findGmailReplyForContact(accessToken, contact, actualSenderEmail, lookbackDays) {
+  const prospect = normalizeEmail(contact.email || contact.best_email || '');
+  if (!prospect) return null;
+
+  // Best path: thread ID returned by Gmail when Scout sent the message.
+  if (contact.gmailThreadId) {
+    try {
+      const t = await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(contact.gmailThreadId)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Date`);
+      const msgs = Array.isArray(t.messages) ? t.messages : [];
+      for (const m of msgs) {
+        const summary = gmailMessageSummary(m);
+        if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, true)) continue;
+        const full = await getFullGmailMessage(accessToken, m.id);
+        const body = extractGmailTextBody(full.payload) || full.snippet || summary.snippet || '';
+        return { ...summary, body, matchMethod: 'thread' };
+      }
+    } catch (_) {}
+  }
+
+  // Fallback: search for any email from that prospect after the message was sent.
+  const after = gmailDateQueryFromIso(contact.sentAt || contact.contactedAt, lookbackDays || 45);
+  const q = `from:${prospect} after:${after}`;
+  const list = await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=10`);
+  const msgs = Array.isArray(list.messages) ? list.messages : [];
+  for (const m of msgs) {
+    const meta = await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(m.id)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Date`);
+    const summary = gmailMessageSummary(meta);
+    if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, false)) continue;
+    const full = await getFullGmailMessage(accessToken, m.id);
+    const body = extractGmailTextBody(full.payload) || full.snippet || summary.snippet || '';
+    return { ...summary, body, matchMethod: 'from_search' };
+  }
+  return null;
+}
+
+app.post('/gmail/check-replies', async (req, res) => {
+  const body = req.body || {};
+  const contacts = (Array.isArray(body.contacts) ? body.contacts : []).filter(c => normalizeEmail(c.email || c.best_email || '')).slice(0, 500);
+  let accessToken = body.access_token || body.accessToken || '';
+  const refreshToken = body.refresh_token || body.refreshToken || '';
+  const clientId = body.client_id || body.clientId || process.env.GOOGLE_CLIENT_ID || '';
+  const lookbackDays = Math.max(1, Math.min(180, parseInt(body.lookbackDays || 45, 10) || 45));
+
+  if (!contacts.length) return res.json({ success: true, checked: 0, replies: [], note: 'No contacted leads supplied.' });
+  if (!accessToken && !refreshToken) return res.status(400).json({ success: false, error: 'Missing Gmail OAuth token.' });
+
+  try {
+    let tokenRefreshed = false;
+    if (!accessToken && refreshToken) {
+      accessToken = await refreshGmailAccessTokenSafe(refreshToken, clientId);
+      tokenRefreshed = true;
+    }
+    const prof = await getGmailProfileWithRetry(accessToken, refreshToken, clientId);
+    accessToken = prof.accessToken || accessToken;
+    tokenRefreshed = tokenRefreshed || !!prof.refreshed;
+    const profile = prof.profile || {};
+    const actualEmail = profile.emailAddress || body.senderEmail || body.email || '';
+    if (!actualEmail) return res.status(400).json({ success: false, error: 'Could not confirm connected Gmail profile. Reconnect Gmail.' });
+
+    const replies = [];
+    const errors = [];
+    for (const c of contacts) {
+      try {
+        const reply = await findGmailReplyForContact(accessToken, c, actualEmail, lookbackDays);
+        if (reply) {
+          replies.push({
+            contactId: c.id || c.leadId || c.businessId || '',
+            contactEmail: normalizeEmail(c.email || c.best_email || ''),
+            contactName: c.name || c.businessName || c.company || '',
+            gmailAccount: actualEmail,
+            gmailMsgId: reply.id,
+            gmailThreadId: reply.threadId,
+            replyFrom: reply.fromEmail || parseEmailFromHeader(reply.fromHeader),
+            replyFromHeader: reply.fromHeader,
+            replyTo: reply.replyToEmail,
+            subject: reply.subject,
+            receivedAt: reply.receivedAt,
+            body: String(reply.body || '').slice(0, 2000),
+            snippet: reply.snippet || '',
+            matchMethod: reply.matchMethod,
+          });
+        }
+      } catch (e) {
+        errors.push({ email: c.email, error: e.message || String(e) });
+      }
+      // Avoid hammering Gmail API for very large lists.
+      if (contacts.length > 50) await sleep(120);
+    }
+
+    res.json({
+      success: true,
+      checked: contacts.length,
+      repliesFound: replies.length,
+      replies,
+      gmailAccount: actualEmail,
+      tokenRefreshed,
+      access_token: tokenRefreshed ? accessToken : undefined,
+      errors: errors.slice(0, 10),
+      note: 'Checked sent thread IDs first, then Gmail from: search. This does not require replies to be unread.'
+    });
+  } catch (e) {
+    const details = gmailApiErrorDetails(e);
+    res.status(details.status || 400).json({ success: false, error: e.message || details.message, reason: details.reason || '', status: details.status || 400 });
+  }
+});
+
+app.get('/gmail/reply-diagnostics', (req, res) => {
+  res.json({
+    success: true,
+    version: '5.5.0-team-scouted-protection',
+    routes: { checkReplies: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
+    requirements: { gmailReadonlyOrModifyScope: true, storedContactedLeads: true, gmailThreadIdPreferred: true },
+    notes: [
+      'Reply tracking checks Contacted leads, not Ready/Pending leads.',
+      'It checks Gmail threadId first when Scout saved it after sending.',
+      'It no longer requires the reply to be unread or only within the last 24 hours.'
+    ]
   });
 });
 
@@ -2682,12 +3178,21 @@ app.get('/maps-campaigns/:id/leads', (req, res) => {
 // ── EMAIL FINDING ─────────────────────────────────────────────────────────────
 
 app.post('/find-email', async (req, res) => {
-  const { website, business_name } = req.body;
-  if (!website) return res.status(400).json({ error: 'website required' });
+  const { website, business_name, debug } = req.body || {};
+  if (!website) return res.status(400).json({ success: false, error: 'website required' });
   try {
-    const r = await crawlSiteForEmail(website);
+    const r = debug ? await crawlSiteForEmailDebug(website) : await crawlSiteForEmail(website);
     res.json({ success: true, business_name, website, ...r });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/debug-find-email', async (req, res) => {
+  const website = String(req.query.website || '').trim();
+  if (!website) return res.status(400).json({ success: false, error: 'website query parameter required' });
+  try {
+    const r = await crawlSiteForEmailDebug(website);
+    res.json({ success: true, website, ...r });
+  } catch(e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // FAST batch — crawls up to 10 sites in parallel
@@ -2749,6 +3254,55 @@ app.post('/extract-place-id', (req, res) => {
   res.json({ place_id: id, found: !!id });
 });
 
+
+// ── TEAM SCOUTED PROTECTION ───────────────────────────────────────────────────
+// Shared registry: if one teammate has already scouted/contacted a lead, the next teammate's Scout App should block it.
+app.get('/team-scouted/diagnostics', (req, res) => {
+  const registry = loadTeamRegistry();
+  res.json({
+    success: true,
+    version: '5.5.0-team-scouted-protection',
+    persistentFile: TEAM_SCOUTED_FILE,
+    counts: {
+      records: Array.isArray(registry.records) ? registry.records.length : 0,
+      emails: Object.keys(registry.byEmail || {}).length,
+      placeIds: Object.keys(registry.byPlaceId || {}).length,
+      domains: Object.keys(registry.byDomain || {}).length,
+      profileLinks: Object.keys(registry.byProfileLink || {}).length,
+      nameDomains: Object.keys(registry.byNameDomain || {}).length,
+    },
+    routes: {
+      check: 'POST /team-scouted/check',
+      mark: 'POST /team-scouted/mark',
+      export: 'GET /team-scouted/export?key=ADMIN_KEY'
+    }
+  });
+});
+
+app.post('/team-scouted/check', (req, res) => {
+  const leads = Array.isArray(req.body?.leads) ? req.body.leads : [];
+  if (!leads.length) return res.status(400).json({ success: false, error: 'Send leads: [{ email, place_id, profileLink, website, domain, name }]' });
+  const registry = loadTeamRegistry();
+  const results = leads.map((lead, index) => {
+    const match = findTeamScoutMatch(lead, registry);
+    return { index, id: lead.id || lead.businessId || '', email: normalizeTeamEmail(lead.email || ''), ...match };
+  });
+  const blocked = results.filter(r => r.blocked).length;
+  res.json({ success: true, checked: leads.length, blocked, results });
+});
+
+app.post('/team-scouted/mark', (req, res) => {
+  const leads = Array.isArray(req.body?.leads) ? req.body.leads : [];
+  if (!leads.length) return res.status(400).json({ success: false, error: 'Send leads array to mark as scouted/contacted.' });
+  const out = markTeamScouted(leads, { actor: req.body.actor || '', senderEmail: req.body.senderEmail || '', batchId: req.body.batchId || '', source: req.body.source || 'scout_app' });
+  res.json({ success: true, ...out });
+});
+
+app.get('/team-scouted/export', (req, res) => {
+  if (req.query.key !== ADMIN_KEY) return res.status(403).json({ success:false, error: 'Unauthorized' });
+  res.json(loadTeamRegistry());
+});
+
 // ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 
 app.get('/contacted/:place_id', (req, res) => {
@@ -2759,10 +3313,13 @@ app.get('/contacted/:place_id', (req, res) => {
 app.post('/check-contacted', (req, res) => {
   const { place_ids } = req.body;
   if (!Array.isArray(place_ids)) return res.status(400).json({ error: 'place_ids array required' });
+  const registry = loadTeamRegistry();
   const results = {};
   place_ids.forEach(id => {
-    results[id] = contactedPlaceIds[id]
-      ? { contacted: true, contacted_at: contactedPlaceIds[id].contacted_at }
+    const oldHit = contactedPlaceIds[id];
+    const teamHit = id && registry.byPlaceId && registry.byPlaceId[id];
+    results[id] = oldHit || teamHit
+      ? { contacted: true, contacted_at: (oldHit && oldHit.contacted_at) || (teamHit && (teamHit.sentAt || teamHit.markedAt)), matchedBy: teamHit ? 'team_scouted_registry' : 'legacy_place_id' }
       : { contacted: false };
   });
   res.json({ results, checked: place_ids.length });
@@ -2778,7 +3335,8 @@ app.post('/mark-contacted', (req, res) => {
     if (contactedPlaceIds[id]) contactedPlaceIds[id].count++;
     else { contactedPlaceIds[id] = { contacted_at: now, count: 1 }; marked++; }
   });
-  res.json({ success: true, marked, total: Object.keys(contactedPlaceIds).length });
+  const team = markTeamScouted(place_ids.map(id => ({ place_id: id, status: 'contacted', contactedAt: now })), { source: 'legacy_mark_contacted', sentAt: now });
+  res.json({ success: true, marked, teamMarked: team.marked, total: Object.keys(contactedPlaceIds).length });
 });
 
 app.get('/contacted', (req, res) => {
@@ -2991,5 +3549,5 @@ app.post('/gmail/profile', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Scout Backend v4.6 Gmail Identity Fix on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
+  console.log(`Scout Backend v5.4 Reply Tracking Fix on port ${PORT} | Admin key: ${ADMIN_KEY} | Maps key: ${GMAPS_KEY?'SET':'NOT SET'}`);
 });

@@ -1,9 +1,6 @@
-Scout Backend v5.0 FINAL Gmail Send Fix
-
-- Adds 15mb JSON body limit for selected batch sends.
-- Keeps sleep() and isLikelyEmail() helpers defined.
-- Rebuilds Gmail raw MIME message with required blank header/body separator.
-- Sanitizes headers to avoid Gmail API malformed-message errors.
-- Keeps token refresh/retry, validation, and diagnostics.
-- /email-scout/send-selected-batch sends actual Gmail API messages and returns Gmail message/thread ids.
-- Scout App frontend marks successful rows as Contacted after sent results are returned.
+Scout Backend v5.5
+- Adds persistent team-scouted registry.
+- Adds /team-scouted/check, /team-scouted/mark, /team-scouted/diagnostics.
+- Gmail send endpoint skips contacts already scouted by the team.
+- Successful Gmail sends are written to the shared registry.
+- Legacy /check-contacted and /mark-contacted now use the shared registry too.
