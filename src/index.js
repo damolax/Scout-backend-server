@@ -262,6 +262,23 @@ const DISPOSABLE_DOMAINS = new Set([
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase().replace(/^mailto:/, '').split('?')[0].replace(/[.,;:)>"]+$/, '').replace(/^[<(\[]+/, '');
 }
+
+function isLikelyEmail(email) {
+  const e = normalizeEmail(email);
+  if (!e || e.length > 254) return false;
+  const parts = emailParts(e);
+  if (!parts.validFormat) return false;
+  if (!parts.local || !parts.domain) return false;
+  if (parts.local.length > 64) return false;
+  if (parts.local.startsWith('.') || parts.local.endsWith('.') || parts.local.includes('..')) return false;
+  if (parts.domain.includes('..')) return false;
+  const labels = parts.domain.split('.');
+  if (labels.some(label => !label || label.length > 63 || label.startsWith('-') || label.endsWith('-'))) return false;
+  if (DISPOSABLE_DOMAINS.has(parts.domain)) return false;
+  if (JUNK.some(j => e.includes(j))) return false;
+  return true;
+}
+
 function emailParts(email) {
   const normalized = normalizeEmail(email);
   const m = normalized.match(/^([a-z0-9._%+\-]{1,64})@([a-z0-9.\-]+\.[a-z]{2,})$/i);
@@ -2287,6 +2304,77 @@ function normalizeSendBatchLimit(v) {
   return Math.max(1, Math.min(500, n));
 }
 
+
+function gmailApiErrorDetails(e) {
+  const status = e && e.response ? e.response.status : 0;
+  const data = (e && e.response && e.response.data) || {};
+  const gErr = data.error || {};
+  const reason = Array.isArray(gErr.errors) && gErr.errors[0] ? (gErr.errors[0].reason || '') : '';
+  const message = gErr.message || data.error_description || data.error || (e && e.message) || String(e || 'Unknown Gmail error');
+  return { status, reason, message, raw: data };
+}
+
+function isRefreshableGmailError(e) {
+  const d = gmailApiErrorDetails(e);
+  const text = `${d.reason} ${d.message}`.toLowerCase();
+  return d.status === 401 || text.includes('invalid credentials') || text.includes('invalid token') || text.includes('auth');
+}
+
+function isInsufficientScopeError(e) {
+  const d = gmailApiErrorDetails(e);
+  const text = `${d.reason} ${d.message}`.toLowerCase();
+  return d.status === 403 && (text.includes('insufficient') || text.includes('scope') || text.includes('permission'));
+}
+
+async function refreshGmailAccessTokenSafe(refreshToken, clientId) {
+  if (!refreshToken) throw new Error('Missing refresh_token. Disconnect and reconnect Gmail with prompt=consent.');
+  if (!clientId) throw new Error('Missing OAuth client_id. Save Google OAuth Client ID in Scout settings.');
+  return await refreshGmailAccessTokenForSend({ refresh_token: refreshToken, client_id: clientId });
+}
+
+async function getGmailProfileWithRetry(accessToken, refreshToken, clientId) {
+  try {
+    const p = await getGmailProfile(accessToken);
+    if (p && p.emailAddress) return { profile: p, accessToken, refreshed: false };
+  } catch (_) {}
+  if (refreshToken) {
+    const fresh = await refreshGmailAccessTokenSafe(refreshToken, clientId);
+    const p2 = await getGmailProfile(fresh);
+    return { profile: p2 || {}, accessToken: fresh, refreshed: true };
+  }
+  return { profile: {}, accessToken, refreshed: false };
+}
+
+async function sendGmailApiMessageWithRetry({ accessToken, refreshToken, clientId, row, fromEmail }) {
+  try {
+    const data = await sendGmailApiMessage(accessToken, row, fromEmail);
+    return { data, accessToken, refreshed: false };
+  } catch (e) {
+    if (isInsufficientScopeError(e)) {
+      const d = gmailApiErrorDetails(e);
+      throw new Error(`${d.message}. Reconnect Gmail with gmail.send permission in Scout settings.`);
+    }
+    if (refreshToken && isRefreshableGmailError(e)) {
+      const fresh = await refreshGmailAccessTokenSafe(refreshToken, clientId);
+      const data = await sendGmailApiMessage(fresh, row, fromEmail);
+      return { data, accessToken: fresh, refreshed: true };
+    }
+    const d = gmailApiErrorDetails(e);
+    throw new Error(d.message);
+  }
+}
+
+function validateSendRow(row) {
+  const email = normalizeEmail(row.email || row.best_email || '');
+  const subject = String(row.subject || row.messageSubject || '').trim();
+  const message = String(row.message || row.body || row.messageBody || '').trim();
+  if (!email) return 'missing email';
+  if (!isLikelyEmail(email)) return 'invalid email format';
+  if (!subject) return 'missing subject';
+  if (!message) return 'missing message body';
+  return '';
+}
+
 function markLeadSendResult(leads, leadId, email, patch) {
   const norm = normalizeEmail(email);
   let updated = 0;
@@ -2337,9 +2425,10 @@ app.post('/email-scout/send-batch', async (req, res) => {
     for (let i = 0; i < ready.length; i++) {
       const lead = ready[i];
       const row = emailScoutRow(lead);
-      if (!row.email || !row.subject || !row.message) {
+      const invalidReason = validateSendRow({ email: row.email, subject: row.subject, message: row.message });
+      if (invalidReason) {
         skipped++;
-        results.push({ id: row.id, email: row.email, status: 'skipped', reason: 'missing email, subject, or message' });
+        results.push({ id: row.id, email: row.email, status: 'skipped', reason: invalidReason });
         continue;
       }
       if (dryRun) {
@@ -2437,17 +2526,25 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
   }
 
   try {
+    let tokenRefreshed = false;
     if (refreshToken && (!accessToken || (expiresAt && expiresAt < nowMs + 60000) || body.forceRefresh)) {
-      accessToken = await refreshGmailAccessTokenForSend({ refresh_token: refreshToken, client_id: clientId });
+      accessToken = await refreshGmailAccessTokenSafe(refreshToken, clientId);
+      tokenRefreshed = true;
     }
-    const profile = accessToken ? await getGmailProfile(accessToken) : {};
+
+    const prof = await getGmailProfileWithRetry(accessToken, refreshToken, clientId);
+    accessToken = prof.accessToken || accessToken;
+    tokenRefreshed = tokenRefreshed || !!prof.refreshed;
+    const profile = prof.profile || {};
     const actualSenderEmail = profile.emailAddress || senderEmailInput || 'connected-gmail-account';
+
     const contacts = rawContacts.slice(0, limit).map((c, i) => ({
       id: c.id || c.leadId || c.businessId || ('contact_' + i),
-      name: c.name || c.businessName || c.company || '',
+      name: c.name || c.businessName || c.business || c.company || '',
       email: normalizeEmail(c.email || c.best_email || ''),
       subject: String(c.subject || c.messageSubject || '').trim(),
-      message: String(c.message || c.body || c.messageBody || '').trim()
+      message: String(c.message || c.body || c.messageBody || '').trim(),
+      templateName: c.templateName || c.messageTemplateName || '',
     }));
 
     const results = [];
@@ -2456,9 +2553,10 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 
     for (let i = 0; i < contacts.length; i++) {
       const row = contacts[i];
-      if (!row.email || !isLikelyEmail(row.email) || !row.subject || !row.message) {
+      const invalidReason = validateSendRow(row);
+      if (invalidReason) {
         skipped++;
-        results.push({ id: row.id, email: row.email, status: 'skipped', reason: 'missing or invalid email, subject, or message' });
+        results.push({ id: row.id, email: row.email, name: row.name, status: 'skipped', reason: invalidReason, subject: row.subject });
         continue;
       }
       if (dryRun) {
@@ -2467,13 +2565,15 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
         continue;
       }
       try {
-        const gmailResult = await sendGmailApiMessage(accessToken, row, actualSenderEmail);
+        const sendResult = await sendGmailApiMessageWithRetry({ accessToken, refreshToken, clientId, row, fromEmail: actualSenderEmail });
+        accessToken = sendResult.accessToken || accessToken;
+        tokenRefreshed = tokenRefreshed || !!sendResult.refreshed;
+        const gmailResult = sendResult.data || {};
         sent++;
         results.push({ id: row.id, email: row.email, name: row.name, status: 'sent', subject: row.subject, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
         failed++;
-        const errData = e.response?.data || {};
-        const reason = errData.error?.message || errData.error_description || e.message || String(e);
+        const reason = (e && e.message) || String(e);
         results.push({ id: row.id, email: row.email, name: row.name, status: 'failed', subject: row.subject, reason });
       }
       if (delayMs && i < contacts.length - 1) await sleep(delayMs);
@@ -2489,15 +2589,38 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
       failed,
       skipped,
       dryRun,
+      tokenRefreshed,
+      access_token: tokenRefreshed ? accessToken : undefined,
       startedAt,
       finishedAt: new Date().toISOString(),
       results,
       note: dryRun ? 'Dry run only. No email was sent.' : 'Messages were sent through the connected Gmail account via Gmail API.'
     });
   } catch (e) {
-    const errData = e.response?.data || {};
-    res.status(400).json({ success: false, error: errData.error?.message || errData.error_description || e.message || String(e) });
+    const details = gmailApiErrorDetails(e);
+    res.status(400).json({ success: false, error: details.message, status: details.status, reason: details.reason });
   }
+});
+
+app.get('/email-scout/send-diagnostics', (req, res) => {
+  res.json({
+    success: true,
+    version: '4.8.0',
+    routes: {
+      selectedBatch: true,
+      sendBatch: true,
+      gmailStatus: true,
+    },
+    env: {
+      googleClientSecretSet: !!process.env.GOOGLE_CLIENT_SECRET,
+      googleClientIdSet: !!process.env.GOOGLE_CLIENT_ID,
+    },
+    validations: {
+      isLikelyEmailDefined: typeof isLikelyEmail === 'function',
+      normalizeEmailDefined: typeof normalizeEmail === 'function',
+    },
+    serverTime: new Date().toISOString(),
+  });
 });
 
 // Google Maps lead campaign routes

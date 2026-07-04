@@ -1,7 +1,7 @@
 {
   "name": "scout-email-finder",
-  "version": "4.3.0",
-  "description": "Scout backend with Email Scout Gmail batch sender and verification ready queue, browser Google Maps import, unified leads, smart templates, dorking, and verification",
+  "version": "4.8.0",
+  "description": "Scout backend with hardened Gmail API batch sender, token refresh retry, validation, diagnostics, and identity resolution",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

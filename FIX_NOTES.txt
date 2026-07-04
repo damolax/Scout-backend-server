@@ -1,1 +1,6 @@
-v4.6: Fix Gmail identity resolution, prevent unknown@gmail.com, add /gmail/profile and diagnostic aliases /gmail/status /gmail/diagnostics /gmail/test.
+Scout Backend v4.8
+- Hardened Gmail API selected batch sending.
+- Added missing/defensive email validation helpers.
+- Retries Gmail send once after refreshing expired access tokens.
+- Returns clearer Gmail scope/token errors.
+- Added /email-scout/send-diagnostics for deployment checks.
