@@ -23,7 +23,7 @@ const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
-app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.5.0-team-scouted-protection', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.6.0-in-app-replies', time: new Date().toISOString() }));
 
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
@@ -2869,7 +2869,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.5.0-team-scouted-protection',
+    version: '5.6.0-in-app-replies',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -3126,8 +3126,8 @@ app.post('/gmail/check-replies', async (req, res) => {
 app.get('/gmail/reply-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.5.0-team-scouted-protection',
-    routes: { checkReplies: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
+    version: '5.6.0-in-app-replies',
+    routes: { checkReplies: true, sendReply: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
     requirements: { gmailReadonlyOrModifyScope: true, storedContactedLeads: true, gmailThreadIdPreferred: true },
     notes: [
       'Reply tracking checks Contacted leads, not Ready/Pending leads.',
@@ -3135,6 +3135,119 @@ app.get('/gmail/reply-diagnostics', (req, res) => {
       'It no longer requires the reply to be unread or only within the last 24 hours.'
     ]
   });
+});
+
+
+
+// ── GMAIL IN-APP REPLY SENDER (v5.6) ────────────────────────────────────────
+// Sends a reply from the selected Gmail account, preferably inside the original Gmail thread.
+function buildGmailRawReplyMessage({ to, from, subject, body, inReplyTo, references }) {
+  const cleanTo = sanitizeHeader(to);
+  const cleanFrom = sanitizeHeader(from);
+  const cleanSubject = sanitizeHeader(subject || 'Re: Your message');
+  const cleanBody = String(body || '').replace(/\r?\n/g, '\r\n');
+  const headers = [];
+  if (cleanFrom && isLikelyEmail(cleanFrom)) headers.push(`From: ${cleanFrom}`);
+  headers.push(`To: ${cleanTo}`);
+  headers.push(`Subject: ${mimeHeader(cleanSubject)}`);
+  if (inReplyTo) headers.push(`In-Reply-To: ${sanitizeHeader(inReplyTo)}`);
+  if (references) headers.push(`References: ${sanitizeHeader(references)}`);
+  headers.push('MIME-Version: 1.0');
+  headers.push('Content-Type: text/plain; charset=UTF-8');
+  headers.push('Content-Transfer-Encoding: 8bit');
+  return base64UrlEncode(headers.join('\r\n') + '\r\n\r\n' + cleanBody);
+}
+
+function validateReplyPayload({ to, subject, body }) {
+  const email = normalizeEmail(to || '');
+  if (!email || !isLikelyEmail(email)) return 'missing or invalid reply recipient';
+  if (!String(subject || '').trim()) return 'missing reply subject';
+  if (!String(body || '').trim()) return 'missing reply body';
+  return '';
+}
+
+async function sendGmailReplyWithRetry({ accessToken, refreshToken, clientId, fromEmail, to, subject, body, threadId, inReplyTo, references }) {
+  async function attempt(token) {
+    const raw = buildGmailRawReplyMessage({ to, from: fromEmail, subject, body, inReplyTo, references });
+    const payload = threadId ? { raw, threadId: String(threadId) } : { raw };
+    const r = await axios.post('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', payload, {
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }
+    });
+    return r.data || {};
+  }
+  try {
+    const data = await attempt(accessToken);
+    return { data, accessToken, refreshed: false };
+  } catch (e) {
+    if (isInsufficientScopeError(e)) {
+      const d = gmailApiErrorDetails(e);
+      throw new Error(`${d.message}. Reconnect Gmail with gmail.send permission in Scout settings.`);
+    }
+    if (refreshToken && isRefreshableGmailError(e)) {
+      const fresh = await refreshGmailAccessTokenSafe(refreshToken, clientId);
+      const data = await attempt(fresh);
+      return { data, accessToken: fresh, refreshed: true };
+    }
+    const d = gmailApiErrorDetails(e);
+    throw new Error(d.message);
+  }
+}
+
+app.post('/gmail/send-reply', async (req, res) => {
+  const body = req.body || {};
+  let accessToken = body.access_token || body.accessToken || '';
+  const refreshToken = body.refresh_token || body.refreshToken || '';
+  const clientId = body.client_id || body.clientId || process.env.GOOGLE_CLIENT_ID || '';
+  const requestedSender = String(body.senderEmail || body.fromEmail || '').trim();
+  const to = normalizeEmail(body.to || body.email || body.replyTo || '');
+  const subject = String(body.subject || '').trim();
+  const replyBody = String(body.body || body.message || body.replyBody || '').trim();
+  const threadId = String(body.threadId || body.gmailThreadId || '').trim();
+  const inReplyTo = String(body.inReplyTo || body.replyToMessageId || '').trim();
+  const references = String(body.references || '').trim();
+  const invalid = validateReplyPayload({ to, subject, body: replyBody });
+
+  if (invalid) return res.status(400).json({ success: false, error: invalid });
+  if (!accessToken && !refreshToken) return res.status(400).json({ success: false, error: 'Missing Gmail OAuth token. Connect Gmail in Scout App Settings first.' });
+
+  try {
+    let tokenRefreshed = false;
+    if (!accessToken && refreshToken) {
+      accessToken = await refreshGmailAccessTokenSafe(refreshToken, clientId);
+      tokenRefreshed = true;
+    }
+    const prof = await getGmailProfileWithRetry(accessToken, refreshToken, clientId);
+    accessToken = prof.accessToken || accessToken;
+    tokenRefreshed = tokenRefreshed || !!prof.refreshed;
+    const profile = prof.profile || {};
+    const actualSender = enforceSelectedGmailSender({ requestedSenderEmail: requestedSender, actualSenderEmail: profile.emailAddress || '' });
+    const sendResult = await sendGmailReplyWithRetry({ accessToken, refreshToken, clientId, fromEmail: actualSender, to, subject, body: replyBody, threadId, inReplyTo, references });
+    accessToken = sendResult.accessToken || accessToken;
+    tokenRefreshed = tokenRefreshed || !!sendResult.refreshed;
+    const data = sendResult.data || {};
+    res.json({
+      success: true,
+      senderEmail: actualSender,
+      to,
+      subject,
+      gmailMessageId: data.id || '',
+      gmailThreadId: data.threadId || threadId || '',
+      tokenRefreshed,
+      access_token: tokenRefreshed ? accessToken : undefined,
+      note: threadId ? 'Reply sent in Gmail thread when Gmail accepted the supplied threadId.' : 'Reply sent as normal Gmail message because no threadId was supplied.'
+    });
+  } catch (e) {
+    const details = gmailApiErrorDetails(e);
+    const httpStatus = e.status || details.status || 400;
+    res.status(httpStatus).json({
+      success: false,
+      error: e.message || details.message,
+      status: httpStatus,
+      code: e.code || details.reason || '',
+      requestedSenderEmail: e.requestedSenderEmail || normalizeSenderEmailForCompare(requestedSender),
+      actualSenderEmail: e.actualSenderEmail || ''
+    });
+  }
 });
 
 // Google Maps lead campaign routes
@@ -3261,7 +3374,7 @@ app.get('/team-scouted/diagnostics', (req, res) => {
   const registry = loadTeamRegistry();
   res.json({
     success: true,
-    version: '5.5.0-team-scouted-protection',
+    version: '5.6.0-in-app-replies',
     persistentFile: TEAM_SCOUTED_FILE,
     counts: {
       records: Array.isArray(registry.records) ? registry.records.length : 0,

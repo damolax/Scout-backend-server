@@ -1,6 +1,4 @@
-Scout Backend v5.5
-- Adds persistent team-scouted registry.
-- Adds /team-scouted/check, /team-scouted/mark, /team-scouted/diagnostics.
-- Gmail send endpoint skips contacts already scouted by the team.
-- Successful Gmail sends are written to the shared registry.
-- Legacy /check-contacted and /mark-contacted now use the shared registry too.
+Scout Backend v5.6
+- Adds /gmail/send-reply for in-app replies from the selected Gmail account.
+- Keeps team-scouted protection from v5.5.
+- Sends replies into the original Gmail thread when threadId is available.
