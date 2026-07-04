@@ -1,7 +1,7 @@
 {
   "name": "scout-email-finder",
-  "version": "4.8.0",
-  "description": "Scout backend with hardened Gmail API batch sender, token refresh retry, validation, diagnostics, and identity resolution",
+  "version": "5.0.0",
+  "description": "Scout backend final hardened Gmail API sender with health, diagnostics, token refresh, validation, and robust MIME building",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

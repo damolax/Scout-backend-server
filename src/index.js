@@ -7,7 +7,7 @@ const dns = require('dns').promises;
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3001;
 const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
@@ -22,6 +22,9 @@ const SEARCH_PROVIDER = String(process.env.SEARCH_PROVIDER || 'auto').toLowerCas
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
+
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.0.0-final-gmail-send', time: new Date().toISOString() }));
+
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
 let contactedPlaceIds = {};
@@ -73,6 +76,12 @@ function csvEscape(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '"
 
 function todayUTC() { return new Date().toISOString().slice(0, 10); }
 function isToday(d) { return d === todayUTC(); }
+
+function sleep(ms) {
+  const n = Math.max(0, Math.min(60000, Number(ms) || 0));
+  if (!n) return Promise.resolve();
+  return new Promise(resolve => setTimeout(resolve, n));
+}
 
 // ── EMAIL HELPERS ─────────────────────────────────────────────────────────────
 
@@ -2247,18 +2256,24 @@ function mimeHeader(value) {
   return '=?UTF-8?B?' + Buffer.from(v, 'utf8').toString('base64') + '?=';
 }
 
+function sanitizeHeader(value) {
+  return String(value || '').replace(/[\r\n]+/g, ' ').trim();
+}
+
 function buildGmailRawMessage({ to, from, subject, body }) {
-  const lines = [
-    from ? `From: ${from}` : '',
-    `To: ${to}`,
-    `Subject: ${mimeHeader(subject || '')}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset=UTF-8',
-    'Content-Transfer-Encoding: 8bit',
-    '',
-    String(body || '')
-  ].filter((line, idx) => idx > 6 || line !== '');
-  return base64UrlEncode(lines.join('\r\n'));
+  const cleanTo = sanitizeHeader(to);
+  const cleanFrom = sanitizeHeader(from);
+  const cleanSubject = sanitizeHeader(subject);
+  const cleanBody = String(body || '').replace(/\r?\n/g, '\r\n');
+  const headers = [];
+  if (cleanFrom && isLikelyEmail(cleanFrom)) headers.push(`From: ${cleanFrom}`);
+  headers.push(`To: ${cleanTo}`);
+  headers.push(`Subject: ${mimeHeader(cleanSubject)}`);
+  headers.push('MIME-Version: 1.0');
+  headers.push('Content-Type: text/plain; charset=UTF-8');
+  headers.push('Content-Transfer-Encoding: 8bit');
+  // Gmail API requires an empty line between headers and body.
+  return base64UrlEncode(headers.join('\r\n') + '\r\n\r\n' + cleanBody);
 }
 
 async function refreshGmailAccessTokenForSend({ refresh_token, client_id }) {
@@ -2287,10 +2302,10 @@ async function getGmailProfile(accessToken) {
 
 async function sendGmailApiMessage(accessToken, row, fromEmail) {
   const raw = buildGmailRawMessage({
-    to: row.email,
+    to: normalizeEmail(row.email || row.best_email || ''),
     from: fromEmail || '',
     subject: row.messageSubject || row.subject || '',
-    body: row.messageBody || row.message || ''
+    body: row.messageBody || row.message || row.body || ''
   });
   const r = await axios.post('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', { raw }, {
     headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' }
@@ -2605,7 +2620,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '4.8.0',
+    version: '5.0.0-final-gmail-send',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -2618,6 +2633,9 @@ app.get('/email-scout/send-diagnostics', (req, res) => {
     validations: {
       isLikelyEmailDefined: typeof isLikelyEmail === 'function',
       normalizeEmailDefined: typeof normalizeEmail === 'function',
+      sleepDefined: typeof sleep === 'function',
+      buildGmailRawMessageDefined: typeof buildGmailRawMessage === 'function',
+      sendGmailApiMessageWithRetryDefined: typeof sendGmailApiMessageWithRetry === 'function',
     },
     serverTime: new Date().toISOString(),
   });
