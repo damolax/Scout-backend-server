@@ -23,7 +23,7 @@ const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
-app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.8.0-bounce-reply-guard', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.9.0-reply-history-dashboard-clean', time: new Date().toISOString() }));
 
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
@@ -2964,7 +2964,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.8.0-bounce-reply-guard',
+    version: '5.9.0-reply-history-dashboard-clean',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -3209,6 +3209,44 @@ async function findGmailReplyForContact(accessToken, contact, actualSenderEmail,
   return null;
 }
 
+
+// v5.9: collect every real prospect response, not only the first one.
+async function findGmailRepliesForContact(accessToken, contact, actualSenderEmail, lookbackDays) {
+  const prospect = normalizeEmail(contact.email || contact.best_email || '');
+  if (!prospect) return [];
+  const found = [];
+  const seen = new Set();
+  async function considerMessage(m, fromThread, methodBase) {
+    if (!m || !m.id || seen.has(String(m.id))) return;
+    seen.add(String(m.id));
+    const summary = m.payload ? gmailMessageSummary(m) : gmailMessageSummary(await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(m.id)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Date`));
+    if (summary.id && contact.gmailMessageId && String(summary.id) === String(contact.gmailMessageId)) return;
+    const full = await getFullGmailMessage(accessToken, summary.id);
+    const body = extractGmailTextBody(full.payload) || full.snippet || summary.snippet || '';
+    const bounce = classifyDeliveryNotice(summary, body, contact);
+    if (bounce) {
+      found.push({ ...summary, body, matchMethod: methodBase + '_delivery_notice', kind: 'bounce', bounceType: bounce.type, bounceReason: bounce.reason });
+      return;
+    }
+    if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, fromThread)) return;
+    found.push({ ...summary, body, matchMethod: methodBase, kind: 'reply' });
+  }
+  if (contact.gmailThreadId) {
+    try {
+      const t = await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(contact.gmailThreadId)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Date`);
+      const msgs = Array.isArray(t.messages) ? t.messages : [];
+      for (const m of msgs) await considerMessage(m, true, 'thread');
+    } catch (_) {}
+  }
+  const after = gmailDateQueryFromIso(contact.sentAt || contact.contactedAt, lookbackDays || 45);
+  const q = `from:${prospect} after:${after}`;
+  const list = await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=20`);
+  const msgs = Array.isArray(list.messages) ? list.messages : [];
+  for (const m of msgs) await considerMessage(m, false, 'from_search');
+  found.sort((a, b) => new Date(a.receivedAt || 0).getTime() - new Date(b.receivedAt || 0).getTime());
+  return found;
+}
+
 app.post('/gmail/check-replies', async (req, res) => {
   const body = req.body || {};
   const contacts = (Array.isArray(body.contacts) ? body.contacts : []).filter(c => normalizeEmail(c.email || c.best_email || '')).slice(0, 500);
@@ -3238,8 +3276,8 @@ app.post('/gmail/check-replies', async (req, res) => {
     const errors = [];
     for (const c of contacts) {
       try {
-        const reply = await findGmailReplyForContact(accessToken, c, actualEmail, lookbackDays);
-        if (reply) {
+        const foundMessages = await findGmailRepliesForContact(accessToken, c, actualEmail, lookbackDays);
+        for (const reply of foundMessages) {
           const base = {
             contactId: c.id || c.leadId || c.businessId || '',
             contactEmail: normalizeEmail(c.email || c.best_email || ''),
@@ -3280,7 +3318,7 @@ app.post('/gmail/check-replies', async (req, res) => {
       tokenRefreshed,
       access_token: tokenRefreshed ? accessToken : undefined,
       errors: errors.slice(0, 10),
-      note: 'Checked sent thread IDs first, then Gmail from: search. Automated Delivery Status / mailer-daemon notices are returned as bounces, not replies.'
+      note: 'Checked sent thread IDs first, then Gmail from: search. Returns every real prospect response found. Automated Delivery Status / mailer-daemon notices are returned as bounces, not replies.'
     });
   } catch (e) {
     const details = gmailApiErrorDetails(e);
@@ -3291,7 +3329,7 @@ app.post('/gmail/check-replies', async (req, res) => {
 app.get('/gmail/reply-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.8.0-bounce-reply-guard',
+    version: '5.9.0-reply-history-dashboard-clean',
     routes: { checkReplies: true, sendReply: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
     requirements: { gmailReadonlyOrModifyScope: true, storedContactedLeads: true, gmailThreadIdPreferred: true },
     notes: [
@@ -3540,7 +3578,7 @@ app.get('/team-scouted/diagnostics', (req, res) => {
   const registry = loadTeamRegistry();
   res.json({
     success: true,
-    version: '5.8.0-bounce-reply-guard',
+    version: '5.9.0-reply-history-dashboard-clean',
     persistentFile: TEAM_SCOUTED_FILE,
     counts: {
       records: Array.isArray(registry.records) ? registry.records.length : 0,
@@ -3773,7 +3811,7 @@ app.post('/gmail/refresh', async (req, res) => {
 function gmailDiagnosticPayload(req) {
   return {
     ok: true,
-    version: 'v5.8-bounce-reply-guard',
+    version: 'v5.9-reply-history-dashboard-clean',
     google_client_secret_set: Boolean(process.env.GOOGLE_CLIENT_SECRET),
     google_client_id_set: Boolean(process.env.GOOGLE_CLIENT_ID),
     gmail_client_secret_env_name: 'GOOGLE_CLIENT_SECRET',
