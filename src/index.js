@@ -564,6 +564,24 @@ async function verifyWithProvider(email, provider) {
   }
 }
 
+
+function addInboxFields(result) {
+  const status = String(result.status || '').toLowerCase();
+  const providerStatus = String(result.providerStatus || '').toLowerCase();
+  const reason = String(result.providerReason || result.mxError || '').toLowerCase();
+  const combined = `${status} ${providerStatus} ${reason}`;
+  let inboxStatus = 'unknown';
+  let mailboxExists = null;
+  if (/\b(valid|deliverable)\b/.test(combined)) {
+    inboxStatus = 'exists';
+    mailboxExists = true;
+  } else if (/invalid|undeliverable|mailbox_not_found|does not exist|recipient_not_found|address_not_found|no_mx|no mx|bad_format|disposable|do_not_mail/.test(combined)) {
+    inboxStatus = 'no_inbox';
+    mailboxExists = false;
+  }
+  return { ...result, inboxStatus, mailboxExists, noInbox: inboxStatus === 'no_inbox' };
+}
+
 async function verifyEmailAddress(email, provider = EMAIL_VERIFIER_PROVIDER) {
   const parts = emailParts(email);
   const base = {
@@ -584,12 +602,12 @@ async function verifyEmailAddress(email, provider = EMAIL_VERIFIER_PROVIDER) {
     checkedAt: new Date().toISOString(),
   };
 
-  if (!parts.validFormat) return { ...base, status: 'invalid', providerReason: 'bad_format', score: 0 };
-  if (base.isDisposable) return { ...base, status: 'invalid', providerReason: 'disposable_domain', score: 0 };
+  if (!parts.validFormat) return addInboxFields({ ...base, status: 'invalid', providerReason: 'bad_format', score: 0 });
+  if (base.isDisposable) return addInboxFields({ ...base, status: 'invalid', providerReason: 'disposable_domain', score: 0 });
 
   const mx = await checkMx(parts.domain);
   base.hasMx = mx.hasMx; base.mxRecords = mx.mxRecords; if (mx.mxError) base.mxError = mx.mxError;
-  if (!base.hasMx) return { ...base, status: 'invalid', providerReason: 'no_mx_records', score: 5 };
+  if (!base.hasMx) return addInboxFields({ ...base, status: 'invalid', providerReason: 'no_mx_records', score: 5 });
 
   const providerResult = await verifyWithProvider(parts.normalized, provider);
   if (providerResult) {
@@ -602,7 +620,7 @@ async function verifyEmailAddress(email, provider = EMAIL_VERIFIER_PROVIDER) {
     if (base.isRoleBased && score > 0) score -= 10;
     if (base.isFreeProvider && score > 0) score -= 5;
     score = Math.max(0, Math.min(100, providerResult.providerScore != null ? Number(providerResult.providerScore) : score));
-    return {
+    return addInboxFields({
       ...base,
       provider: providerResult.provider,
       providerStatus: providerResult.providerStatus,
@@ -611,14 +629,14 @@ async function verifyEmailAddress(email, provider = EMAIL_VERIFIER_PROVIDER) {
       status: providerResult.status,
       score,
       readyToContact: providerResult.status === 'valid' && score >= 70,
-    };
+    });
   }
 
   // Built-in free mode: safe but conservative. It proves the domain can receive mail, not that this mailbox exists.
   let score = 58;
   if (base.isRoleBased) score -= 8;
   if (base.isFreeProvider) score -= 5;
-  return {
+  return addInboxFields({
     ...base,
     provider: 'basic_mx',
     providerStatus: 'mx_found_only',
@@ -626,7 +644,7 @@ async function verifyEmailAddress(email, provider = EMAIL_VERIFIER_PROVIDER) {
     status: base.isRoleBased ? 'risky' : 'needs_provider',
     score,
     readyToContact: false,
-  };
+  });
 }
 
 function applyVerificationToLead(lead, result) {
@@ -1505,7 +1523,7 @@ app.get('/verifier-config', (req, res) => {
     requestedProvider: provider || 'basic_mx',
     hasProviderKey: !!getVerifierProviderKey(provider),
     supportedProviders: ['basic_mx','zerobounce','abstract','hunter','neverbounce','kickbox'],
-    note: getVerifierProviderKey(provider) ? 'Mailbox-level verification enabled.' : 'Using built-in format + DNS/MX verification only until you add a verifier API key.'
+    note: getVerifierProviderKey(provider) ? 'Mailbox-level inbox verification enabled.' : 'Using built-in format + DNS/MX verification only. Add ZeroBounce/Hunter/NeverBounce/Kickbox/Abstract for true inbox checks.'
   });
 });
 

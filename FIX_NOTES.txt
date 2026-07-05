@@ -1,3 +1,7 @@
+Scout Backend v6.1 - Inbox Status
+
+Adds inboxStatus/mailboxExists/noInbox fields to /verify-email and /batch-verify-emails. Provider-confirmed invalid/undeliverable/no-MX emails can now be moved to Scout App No Inbox instead of Review. True mailbox confirmation still requires an external verifier provider API key.
+
 Scout Backend v5.8 — Real Reply / Bounce Guard
 
 Fixes reply tracking so automated Gmail delivery notices are NOT counted as prospect replies.
