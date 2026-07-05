@@ -23,7 +23,7 @@ const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
-app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '6.0.0-reply-time-strict', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '6.2.0-bounce-no-inbox-live-timestamps', time: new Date().toISOString() }));
 
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
@@ -2743,8 +2743,9 @@ app.post('/email-scout/send-batch', async (req, res) => {
         };
         markLeadSendResult(leads, row.id, row.email, patch);
         sent++;
-        markTeamScouted([{ ...row, status: 'contacted', sentAt: new Date().toISOString(), senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
-        results.push({ id: row.id, email: row.email, status: 'sent', gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
+        const sentAt = new Date().toISOString();
+        markTeamScouted([{ ...row, status: 'contacted', sentAt, senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
+        results.push({ id: row.id, email: row.email, status: 'sent', sentAt, senderEmail: actualSenderEmail, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
         if (isGmailSendLimitError(e)) {
           failed++;
@@ -2905,8 +2906,9 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
         tokenRefreshed = tokenRefreshed || !!sendResult.refreshed;
         const gmailResult = sendResult.data || {};
         sent++;
-        markTeamScouted([{ ...row, status: 'contacted', sentAt: new Date().toISOString(), senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
-        results.push({ id: row.id, email: row.email, name: row.name, status: 'sent', subject: row.subject, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
+        const sentAt = new Date().toISOString();
+        markTeamScouted([{ ...row, status: 'contacted', sentAt, senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
+        results.push({ id: row.id, email: row.email, name: row.name, status: 'sent', subject: row.subject, sentAt, senderEmail: actualSenderEmail, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
         if (isGmailSendLimitError(e)) {
           failed++;
@@ -2982,7 +2984,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '6.0.0-reply-time-strict',
+    version: '6.2.0-bounce-no-inbox-live-timestamps',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -3345,10 +3347,26 @@ app.post('/gmail/check-replies', async (req, res) => {
   }
 });
 
+
+
+app.get('/email-scout/bounce-no-inbox-diagnostics', (req, res) => {
+  res.json({
+    success: true,
+    version: '6.2.0-bounce-no-inbox-live-timestamps',
+    behavior: {
+      deliveryNoticesCountAsReplies: false,
+      mailerDaemonAsBounce: true,
+      invalidRecipientGoesNoInbox: true,
+      senderLimitGoesSenderPausedNotResponse: true,
+      sentResultsIncludeExactSentAt: true
+    },
+    serverTime: new Date().toISOString()
+  });
+});
 app.get('/gmail/reply-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '6.0.0-reply-time-strict',
+    version: '6.2.0-bounce-no-inbox-live-timestamps',
     routes: { checkReplies: true, sendReply: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
     requirements: { gmailReadonlyOrModifyScope: true, storedContactedLeads: true, gmailThreadIdPreferred: true },
     notes: [
@@ -3598,7 +3616,7 @@ app.get('/team-scouted/diagnostics', (req, res) => {
   const registry = loadTeamRegistry();
   res.json({
     success: true,
-    version: '6.0.0-reply-time-strict',
+    version: '6.2.0-bounce-no-inbox-live-timestamps',
     persistentFile: TEAM_SCOUTED_FILE,
     counts: {
       records: Array.isArray(registry.records) ? registry.records.length : 0,
@@ -3831,7 +3849,7 @@ app.post('/gmail/refresh', async (req, res) => {
 function gmailDiagnosticPayload(req) {
   return {
     ok: true,
-    version: 'v6.0-reply-time-strict',
+    version: 'v6.2-bounce-no-inbox-live-timestamps',
     google_client_secret_set: Boolean(process.env.GOOGLE_CLIENT_SECRET),
     google_client_id_set: Boolean(process.env.GOOGLE_CLIENT_ID),
     gmail_client_secret_env_name: 'GOOGLE_CLIENT_SECRET',

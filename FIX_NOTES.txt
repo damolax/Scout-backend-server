@@ -1,14 +1,7 @@
-Scout Backend v6.1 - Inbox Status
+Scout backend v6.2 — bounce/no-inbox cleanup and exact send timestamps
 
-Adds inboxStatus/mailboxExists/noInbox fields to /verify-email and /batch-verify-emails. Provider-confirmed invalid/undeliverable/no-MX emails can now be moved to Scout App No Inbox instead of Review. True mailbox confirmation still requires an external verifier provider API key.
-
-Scout Backend v5.8 — Real Reply / Bounce Guard
-
-Fixes reply tracking so automated Gmail delivery notices are NOT counted as prospect replies.
-
-Changes:
-- Detects Mail Delivery Subsystem, mailer-daemon, postmaster, Delivery Status Notification, address-not-found, undeliverable, and Gmail send-limit messages.
-- Returns these as bounces[] instead of replies[].
-- Keeps real prospect replies using thread ID first, then sender search.
-- Supports bounceType values such as sender_limit, invalid_recipient, mailbox_full, delivery_blocked, and delivery_failed.
-- Keeps v5.7 Gmail send-limit stopping behavior.
+- Send results now include exact sentAt and senderEmail per message.
+- Delivery notices/mailer-daemon are treated as bounces, not replies.
+- Invalid recipient bounces should map to No Inbox in Scout App.
+- Sender-limit notices are not responses and should pause sender / return unsent lead to Ready.
+- Added /email-scout/bounce-no-inbox-diagnostics.
