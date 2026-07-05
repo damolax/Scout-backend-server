@@ -23,7 +23,7 @@ const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
-app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.6.0-in-app-replies', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.8.0-bounce-reply-guard', time: new Date().toISOString() }));
 
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
@@ -2535,6 +2535,42 @@ function isInsufficientScopeError(e) {
   return d.status === 403 && (text.includes('insufficient') || text.includes('scope') || text.includes('permission'));
 }
 
+
+function isGmailSendLimitError(e) {
+  const d = gmailApiErrorDetails(e);
+  const text = `${d.reason} ${d.message} ${JSON.stringify(d.raw || {})}`.toLowerCase();
+  // Gmail returns several variants when a sender hits daily/user/project send limits.
+  // Treat these as account-level stop signals so the batch stops immediately instead of
+  // burning through the rest of the list with repeated failures.
+  return d.status === 429 || (
+    (d.status === 403 || d.status === 400) && (
+      text.includes('ratelimitexceeded') ||
+      text.includes('userratelimitexceeded') ||
+      text.includes('dailylimitexceeded') ||
+      text.includes('quotaexceeded') ||
+      text.includes('quota exceeded') ||
+      text.includes('limit exceeded') ||
+      text.includes('sending limit') ||
+      text.includes('mail sending') ||
+      text.includes('daily user sending') ||
+      text.includes('too many')
+    )
+  );
+}
+
+function gmailSendLimitPayload(e, senderEmail) {
+  const d = gmailApiErrorDetails(e);
+  const until = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  return {
+    code: 'gmail_send_limit_reached',
+    reason: d.reason || 'gmail_send_limit_reached',
+    message: d.message || 'Gmail sending limit reached for this sender.',
+    senderEmail: senderEmail || '',
+    pausedUntil: until,
+    httpStatus: d.status || 403,
+  };
+}
+
 async function refreshGmailAccessTokenSafe(refreshToken, clientId) {
   if (!refreshToken) throw new Error('Missing refresh_token. Disconnect and reconnect Gmail with prompt=consent.');
   if (!clientId) throw new Error('Missing OAuth client_id. Save Google OAuth Client ID in Scout settings.');
@@ -2692,6 +2728,33 @@ app.post('/email-scout/send-batch', async (req, res) => {
         markTeamScouted([{ ...row, status: 'contacted', sentAt: new Date().toISOString(), senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
         results.push({ id: row.id, email: row.email, status: 'sent', gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
+        if (isGmailSendLimitError(e)) {
+          failed++;
+          const limitInfo = gmailSendLimitPayload(e, actualSenderEmail);
+          markLeadSendResult(leads, row.id, row.email, {
+            contactStatus: 'send_failed',
+            sendFailedAt: new Date().toISOString(),
+            sentBy: actualSenderEmail,
+            sendBatchId: batchId,
+            sendProvider: 'gmail_api',
+            lastSendError: limitInfo.message,
+          });
+          results.push({ id: row.id, email: row.email, status: 'failed', reason: limitInfo.message, code: limitInfo.code, stopBatch: true, pausedUntil: limitInfo.pausedUntil });
+          const remaining = ready.length - i - 1;
+          for (let j = i + 1; j < ready.length; j++) {
+            const r2 = emailScoutRow(ready[j]);
+            results.push({ id: r2.id, email: r2.email, status: 'not_sent', reason: 'sender_send_limit_reached', code: 'sender_send_limit_reached', pausedUntil: limitInfo.pausedUntil });
+          }
+          skipped += remaining;
+          if (!dryRun) writeJsonFile(DORK_LEADS_FILE, leads);
+          return res.status(429).json({
+            success: false, batchId, senderEmail: actualSenderEmail, selectedSenderEmail: normalizeSenderEmailForCompare(senderEmailInput),
+            senderVerifiedMatchesSelected: true, requested: limit, attempted: i + 1, sent, failed, skipped, dryRun,
+            forceStopped: true, stopReason: 'gmail_send_limit_reached', senderPaused: true, senderPausedUntil: limitInfo.pausedUntil,
+            error: `Gmail sending limit reached for ${actualSenderEmail}. Scout stopped this batch immediately. Remaining contacts were not sent.`,
+            results, startedAt: now, finishedAt: new Date().toISOString()
+          });
+        }
         failed++;
         const errData = e.response?.data || {};
         const reason = errData.error?.message || errData.error_description || e.message || String(e);
@@ -2827,6 +2890,38 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
         markTeamScouted([{ ...row, status: 'contacted', sentAt: new Date().toISOString(), senderEmail: actualSenderEmail, batchId }], { actor: actualSenderEmail, senderEmail: actualSenderEmail, batchId, source: 'gmail_api_send' });
         results.push({ id: row.id, email: row.email, name: row.name, status: 'sent', subject: row.subject, gmailMessageId: gmailResult.id || '', gmailThreadId: gmailResult.threadId || '' });
       } catch (e) {
+        if (isGmailSendLimitError(e)) {
+          failed++;
+          const limitInfo = gmailSendLimitPayload(e, actualSenderEmail);
+          results.push({ id: row.id, email: row.email, name: row.name, status: 'failed', subject: row.subject, reason: limitInfo.message, code: limitInfo.code, stopBatch: true, senderEmail: actualSenderEmail, pausedUntil: limitInfo.pausedUntil });
+          const remaining = contacts.length - i - 1;
+          for (let j = i + 1; j < contacts.length; j++) {
+            const r2 = contacts[j];
+            results.push({ id: r2.id, email: r2.email, name: r2.name, status: 'not_sent', subject: r2.subject, reason: 'sender_send_limit_reached', code: 'sender_send_limit_reached', senderEmail: actualSenderEmail, pausedUntil: limitInfo.pausedUntil });
+          }
+          skipped += remaining;
+          return res.status(429).json({
+            success: false,
+            batchId,
+            senderEmail: actualSenderEmail,
+            requested: limit,
+            attempted: i + 1,
+            sent,
+            failed,
+            skipped,
+            dryRun,
+            tokenRefreshed,
+            access_token: tokenRefreshed ? accessToken : undefined,
+            forceStopped: true,
+            stopReason: 'gmail_send_limit_reached',
+            senderPaused: true,
+            senderPausedUntil: limitInfo.pausedUntil,
+            error: `Gmail sending limit reached for ${actualSenderEmail}. Scout stopped this batch immediately. Remaining contacts were not sent.`,
+            results,
+            startedAt,
+            finishedAt: new Date().toISOString()
+          });
+        }
         failed++;
         const reason = (e && e.message) || String(e);
         results.push({ id: row.id, email: row.email, name: row.name, status: 'failed', subject: row.subject, reason });
@@ -2869,7 +2964,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.6.0-in-app-replies',
+    version: '5.8.0-bounce-reply-guard',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -2885,6 +2980,7 @@ app.get('/email-scout/send-diagnostics', (req, res) => {
       sleepDefined: typeof sleep === 'function',
       buildGmailRawMessageDefined: typeof buildGmailRawMessage === 'function',
       sendGmailApiMessageWithRetryDefined: typeof sendGmailApiMessageWithRetry === 'function',
+      gmailSendLimitDetectionDefined: typeof isGmailSendLimitError === 'function',
       enforceSelectedGmailSenderDefined: typeof enforceSelectedGmailSender === 'function',
     },
     serverTime: new Date().toISOString(),
@@ -2998,10 +3094,66 @@ function gmailMessageSummary(msg) {
   return { id: msg.id, threadId: msg.threadId, fromHeader, replyToHeader, fromEmail, replyToEmail, subject, dateHeader, receivedAt, snippet: msg.snippet || '' };
 }
 
+
+// v5.8: Delivery Status / bounce messages are not prospect replies.
+function isSystemDeliverySender(emailOrHeader) {
+  const v = String(emailOrHeader || '').toLowerCase();
+  const email = normalizeEmail(parseEmailFromHeader(v) || v);
+  if (!email) return false;
+  const local = email.split('@')[0] || '';
+  const domain = email.split('@')[1] || '';
+  return (
+    email === 'mailer-daemon@googlemail.com' ||
+    email === 'mailer-daemon@google.com' ||
+    email === 'mail-daemon@googlemail.com' ||
+    email === 'postmaster@googlemail.com' ||
+    local === 'mailer-daemon' ||
+    local === 'mail-daemon' ||
+    local === 'postmaster' ||
+    local === 'noreply' ||
+    local === 'no-reply' ||
+    /googlemail\.com$/.test(domain) && /daemon|postmaster/.test(local)
+  );
+}
+
+function deliveryNoticeSubject(subject) {
+  const s = String(subject || '').toLowerCase();
+  return /delivery status notification|delivery failure|undeliverable|returned mail|mail delivery subsystem|failure notice|message not delivered|address not found|delivery incomplete|mail delivery failed/.test(s);
+}
+
+function classifyDeliveryNotice(summary, body, contact) {
+  const from = `${summary?.fromHeader || ''} ${summary?.fromEmail || ''}`;
+  const subject = summary?.subject || '';
+  const text = `${subject}
+${summary?.snippet || ''}
+${body || ''}`.toLowerCase();
+  const fromSystem = isSystemDeliverySender(from) || isSystemDeliverySender(summary?.replyToHeader || '') || isSystemDeliverySender(summary?.replyToEmail || '');
+  const subjectSystem = deliveryNoticeSubject(subject);
+  const bodySystem = /mail delivery subsystem|delivery status notification|your message wasn't delivered|message was not sent|message not delivered|undeliverable|address not found|couldn't be found|unable to receive mail|quota exceeded|you have reached a limit for sending mail|limit for sending mail|recipient address rejected|550 |5\.1\.1|5\.2\.2|5\.4\.1|5\.7\.0/.test(text);
+  if (!(fromSystem || subjectSystem || bodySystem)) return null;
+  let type = 'delivery_failed';
+  let reason = 'Delivery failure / automated mail notification';
+  if (/you have reached a limit for sending mail|limit for sending mail|daily user sending quota|user-rate limit exceeded|rate limit|quota exceeded|too many messages/.test(text)) {
+    type = 'sender_limit';
+    reason = 'Gmail sending limit reached; message was not sent';
+  } else if (/address not found|couldn't be found|recipient address rejected|does not exist|no such user|user unknown|invalid recipient|5\.1\.1|unable to receive mail/.test(text)) {
+    type = 'invalid_recipient';
+    reason = 'Recipient address not found / invalid';
+  } else if (/mailbox full|over quota|quota exceeded|5\.2\.2/.test(text)) {
+    type = 'mailbox_full';
+    reason = 'Recipient mailbox full / over quota';
+  } else if (/blocked|rejected|policy|spam|5\.7\.0|5\.7\.1/.test(text)) {
+    type = 'delivery_blocked';
+    reason = 'Delivery blocked/rejected by remote server';
+  }
+  return { type, reason };
+}
+
 function isLikelyReplyForContact(summary, contact, actualSenderEmail, fromThread) {
   const prospect = normalizeEmail(contact.email || contact.best_email || '');
   const actual = normalizeEmail(actualSenderEmail || '');
   if (!prospect) return false;
+  if (classifyDeliveryNotice(summary, summary?.snippet || '', contact)) return false;
   if (summary.id && contact.gmailMessageId && String(summary.id) === String(contact.gmailMessageId)) return false;
   if (actual && (summary.fromEmail === actual || summary.replyToEmail === actual)) return false;
   const sentMs = new Date(contact.sentAt || contact.contactedAt || 0).getTime();
@@ -3028,10 +3180,13 @@ async function findGmailReplyForContact(accessToken, contact, actualSenderEmail,
       const msgs = Array.isArray(t.messages) ? t.messages : [];
       for (const m of msgs) {
         const summary = gmailMessageSummary(m);
-        if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, true)) continue;
+        if (summary.id && contact.gmailMessageId && String(summary.id) === String(contact.gmailMessageId)) continue;
         const full = await getFullGmailMessage(accessToken, m.id);
         const body = extractGmailTextBody(full.payload) || full.snippet || summary.snippet || '';
-        return { ...summary, body, matchMethod: 'thread' };
+        const bounce = classifyDeliveryNotice(summary, body, contact);
+        if (bounce) return { ...summary, body, matchMethod: 'thread_delivery_notice', kind: 'bounce', bounceType: bounce.type, bounceReason: bounce.reason };
+        if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, true)) continue;
+        return { ...summary, body, matchMethod: 'thread', kind: 'reply' };
       }
     } catch (_) {}
   }
@@ -3044,10 +3199,12 @@ async function findGmailReplyForContact(accessToken, contact, actualSenderEmail,
   for (const m of msgs) {
     const meta = await gmailApiGet(accessToken, `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(m.id)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Date`);
     const summary = gmailMessageSummary(meta);
-    if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, false)) continue;
     const full = await getFullGmailMessage(accessToken, m.id);
     const body = extractGmailTextBody(full.payload) || full.snippet || summary.snippet || '';
-    return { ...summary, body, matchMethod: 'from_search' };
+    const bounce = classifyDeliveryNotice(summary, body, contact);
+    if (bounce) return { ...summary, body, matchMethod: 'from_search_delivery_notice', kind: 'bounce', bounceType: bounce.type, bounceReason: bounce.reason };
+    if (!isLikelyReplyForContact(summary, contact, actualSenderEmail, false)) continue;
+    return { ...summary, body, matchMethod: 'from_search', kind: 'reply' };
   }
   return null;
 }
@@ -3077,12 +3234,13 @@ app.post('/gmail/check-replies', async (req, res) => {
     if (!actualEmail) return res.status(400).json({ success: false, error: 'Could not confirm connected Gmail profile. Reconnect Gmail.' });
 
     const replies = [];
+    const bounces = [];
     const errors = [];
     for (const c of contacts) {
       try {
         const reply = await findGmailReplyForContact(accessToken, c, actualEmail, lookbackDays);
         if (reply) {
-          replies.push({
+          const base = {
             contactId: c.id || c.leadId || c.businessId || '',
             contactEmail: normalizeEmail(c.email || c.best_email || ''),
             contactName: c.name || c.businessName || c.company || '',
@@ -3097,7 +3255,12 @@ app.post('/gmail/check-replies', async (req, res) => {
             body: String(reply.body || '').slice(0, 2000),
             snippet: reply.snippet || '',
             matchMethod: reply.matchMethod,
-          });
+          };
+          if (reply.kind === 'bounce') {
+            bounces.push({ ...base, bounceType: reply.bounceType || 'delivery_failed', bounceReason: reply.bounceReason || 'Delivery failure / automated mail notification' });
+          } else {
+            replies.push(base);
+          }
         }
       } catch (e) {
         errors.push({ email: c.email, error: e.message || String(e) });
@@ -3111,11 +3274,13 @@ app.post('/gmail/check-replies', async (req, res) => {
       checked: contacts.length,
       repliesFound: replies.length,
       replies,
+      bouncesFound: bounces.length,
+      bounces,
       gmailAccount: actualEmail,
       tokenRefreshed,
       access_token: tokenRefreshed ? accessToken : undefined,
       errors: errors.slice(0, 10),
-      note: 'Checked sent thread IDs first, then Gmail from: search. This does not require replies to be unread.'
+      note: 'Checked sent thread IDs first, then Gmail from: search. Automated Delivery Status / mailer-daemon notices are returned as bounces, not replies.'
     });
   } catch (e) {
     const details = gmailApiErrorDetails(e);
@@ -3126,13 +3291,14 @@ app.post('/gmail/check-replies', async (req, res) => {
 app.get('/gmail/reply-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.6.0-in-app-replies',
+    version: '5.8.0-bounce-reply-guard',
     routes: { checkReplies: true, sendReply: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
     requirements: { gmailReadonlyOrModifyScope: true, storedContactedLeads: true, gmailThreadIdPreferred: true },
     notes: [
       'Reply tracking checks Contacted leads, not Ready/Pending leads.',
       'It checks Gmail threadId first when Scout saved it after sending.',
-      'It no longer requires the reply to be unread or only within the last 24 hours.'
+      'It no longer requires the reply to be unread or only within the last 24 hours.',
+      'It rejects Mail Delivery Subsystem / mailer-daemon / address-not-found / send-limit notices as real replies.'
     ]
   });
 });
@@ -3374,7 +3540,7 @@ app.get('/team-scouted/diagnostics', (req, res) => {
   const registry = loadTeamRegistry();
   res.json({
     success: true,
-    version: '5.6.0-in-app-replies',
+    version: '5.8.0-bounce-reply-guard',
     persistentFile: TEAM_SCOUTED_FILE,
     counts: {
       records: Array.isArray(registry.records) ? registry.records.length : 0,
@@ -3607,7 +3773,7 @@ app.post('/gmail/refresh', async (req, res) => {
 function gmailDiagnosticPayload(req) {
   return {
     ok: true,
-    version: 'v4.6-gmail-identity-fix',
+    version: 'v5.8-bounce-reply-guard',
     google_client_secret_set: Boolean(process.env.GOOGLE_CLIENT_SECRET),
     google_client_id_set: Boolean(process.env.GOOGLE_CLIENT_ID),
     gmail_client_secret_env_name: 'GOOGLE_CLIENT_SECRET',

@@ -1,4 +1,10 @@
-Scout Backend v5.6
-- Adds /gmail/send-reply for in-app replies from the selected Gmail account.
-- Keeps team-scouted protection from v5.5.
-- Sends replies into the original Gmail thread when threadId is available.
+Scout Backend v5.8 — Real Reply / Bounce Guard
+
+Fixes reply tracking so automated Gmail delivery notices are NOT counted as prospect replies.
+
+Changes:
+- Detects Mail Delivery Subsystem, mailer-daemon, postmaster, Delivery Status Notification, address-not-found, undeliverable, and Gmail send-limit messages.
+- Returns these as bounces[] instead of replies[].
+- Keeps real prospect replies using thread ID first, then sender search.
+- Supports bounceType values such as sender_limit, invalid_recipient, mailbox_full, delivery_blocked, and delivery_failed.
+- Keeps v5.7 Gmail send-limit stopping behavior.
