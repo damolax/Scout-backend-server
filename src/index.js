@@ -23,7 +23,7 @@ const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || '';
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
 const GOOGLE_CSE_CX = process.env.GOOGLE_CSE_CX || process.env.GOOGLE_CUSTOM_SEARCH_CX || '';
 
-app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '5.9.0-reply-history-dashboard-clean', time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ success: true, service: 'Scout backend', version: '6.0.0-reply-time-strict', time: new Date().toISOString() }));
 
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────────────────────
@@ -2964,7 +2964,7 @@ app.post('/email-scout/send-selected-batch', async (req, res) => {
 app.get('/email-scout/send-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.9.0-reply-history-dashboard-clean',
+    version: '6.0.0-reply-time-strict',
     routes: {
       selectedBatch: true,
       sendBatch: true,
@@ -3158,7 +3158,7 @@ function isLikelyReplyForContact(summary, contact, actualSenderEmail, fromThread
   if (actual && (summary.fromEmail === actual || summary.replyToEmail === actual)) return false;
   const sentMs = new Date(contact.sentAt || contact.contactedAt || 0).getTime();
   const msgMs = new Date(summary.receivedAt || 0).getTime();
-  if (sentMs && msgMs && msgMs < sentMs - 5 * 60 * 1000) return false;
+  if (sentMs && msgMs && msgMs <= sentMs) return false;
   if (summary.fromEmail === prospect || summary.replyToEmail === prospect) return true;
   // If Gmail kept the reply inside the exact sent thread, accept any non-self sender.
   if (fromThread && summary.fromEmail && summary.fromEmail !== actual) return true;
@@ -3293,6 +3293,7 @@ app.post('/gmail/check-replies', async (req, res) => {
             body: String(reply.body || '').slice(0, 2000),
             snippet: reply.snippet || '',
             matchMethod: reply.matchMethod,
+            originalSentAt: c.sentAt || c.contactedAt || '',
           };
           if (reply.kind === 'bounce') {
             bounces.push({ ...base, bounceType: reply.bounceType || 'delivery_failed', bounceReason: reply.bounceReason || 'Delivery failure / automated mail notification' });
@@ -3329,14 +3330,15 @@ app.post('/gmail/check-replies', async (req, res) => {
 app.get('/gmail/reply-diagnostics', (req, res) => {
   res.json({
     success: true,
-    version: '5.9.0-reply-history-dashboard-clean',
+    version: '6.0.0-reply-time-strict',
     routes: { checkReplies: true, sendReply: true, replyDiagnostics: true, gmailRefresh: true, gmailProfile: true },
     requirements: { gmailReadonlyOrModifyScope: true, storedContactedLeads: true, gmailThreadIdPreferred: true },
     notes: [
       'Reply tracking checks Contacted leads, not Ready/Pending leads.',
       'It checks Gmail threadId first when Scout saved it after sending.',
       'It no longer requires the reply to be unread or only within the last 24 hours.',
-      'It rejects Mail Delivery Subsystem / mailer-daemon / address-not-found / send-limit notices as real replies.'
+      'It rejects Mail Delivery Subsystem / mailer-daemon / address-not-found / send-limit notices as real replies.',
+      'It rejects any reply whose Gmail timestamp is before or equal to the original Scout sent/contacted time.'
     ]
   });
 });
@@ -3578,7 +3580,7 @@ app.get('/team-scouted/diagnostics', (req, res) => {
   const registry = loadTeamRegistry();
   res.json({
     success: true,
-    version: '5.9.0-reply-history-dashboard-clean',
+    version: '6.0.0-reply-time-strict',
     persistentFile: TEAM_SCOUTED_FILE,
     counts: {
       records: Array.isArray(registry.records) ? registry.records.length : 0,
@@ -3811,7 +3813,7 @@ app.post('/gmail/refresh', async (req, res) => {
 function gmailDiagnosticPayload(req) {
   return {
     ok: true,
-    version: 'v5.9-reply-history-dashboard-clean',
+    version: 'v6.0-reply-time-strict',
     google_client_secret_set: Boolean(process.env.GOOGLE_CLIENT_SECRET),
     google_client_id_set: Boolean(process.env.GOOGLE_CLIENT_ID),
     gmail_client_secret_env_name: 'GOOGLE_CLIENT_SECRET',
